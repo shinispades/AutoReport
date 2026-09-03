@@ -44,7 +44,7 @@ collection_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection"
 template_path = "Report Template.docx"
 
 # ================= AUTO-UPDATE CONFIG =================
-APP_VERSION = "3.0.4"
+APP_VERSION = "3.0.5"
 GITHUB_REPO = "shinispades/AutoReport"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -2142,6 +2142,11 @@ class LoginWindow(QtWidgets.QWidget):
             footer.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(footer)
 
+            build_label = QtWidgets.QLabel(f"Release v{APP_VERSION}")
+            build_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+            build_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(build_label)
+
         self.main_layout.addWidget(
             card,
             alignment=QtCore.Qt.AlignmentFlag.AlignCenter
@@ -2625,6 +2630,11 @@ class LoginWindow(QtWidgets.QWidget):
         )
 
         layout.addWidget(register_label)
+
+        build_label = QtWidgets.QLabel(f"Release v{APP_VERSION}")
+        build_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+        build_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(build_label)
 
         self.username.returnPressed.connect(self.login_btn.click)
         self.password.returnPressed.connect(self.login_btn.click)
