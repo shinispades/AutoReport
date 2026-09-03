@@ -45,7 +45,7 @@ template_path = "Report Template.docx"
 
 # ================= AUTO-UPDATE CONFIG =================
 APP_VERSION = "3.0.0"
-GITHUB_REPO = "shinispades/AutoReport"  # <-- Change this to your GitHub username/repo
+GITHUB_REPO = "shinispades/AutoReport"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 
