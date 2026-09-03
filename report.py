@@ -18,7 +18,8 @@ from PyQt6.QtGui import QIcon, QDesktopServices
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QApplication,
     QDialog, QFormLayout, QLineEdit, QComboBox,
-    QPushButton, QHBoxLayout, QMessageBox
+    QPushButton, QHBoxLayout, QMessageBox,
+    QTextEdit, QFileDialog
 )
 
 import pytz
@@ -44,7 +45,7 @@ collection_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection"
 template_path = "Report Template.docx"
 
 # ================= AUTO-UPDATE CONFIG =================
-APP_VERSION = "3.0.5"
+APP_VERSION = "3.0.6"
 GITHUB_REPO = "shinispades/AutoReport"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -66,11 +67,11 @@ TOOL_REGISTRY = [
     # --- Tool 1 ---
     {
         "id": "tool_1",
-        "name": "Tool 1",
-        "description": "Description for Tool 1",
-        "icon": "🔧",
+        "name": "Missing Sales Generator",
+        "description": "Generate diagnostic SQL and helper scripts for missing POS sales",
+        "icon": "🗃️",
         "handler": "run_tool_1",
-        "category": "General",
+        "category": "Reports",
     },
     # --- Tool 2 ---
     {
@@ -1078,6 +1079,319 @@ class PBICreatedDialog(QDialog):
         btn_layout.addWidget(close_btn)
 
         layout.addLayout(btn_layout)
+
+
+class MissingSalesDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Missing Sales Generator")
+        self.setMinimumWidth(560)
+
+        dark = is_windows_dark_mode()
+        if dark:
+            self.setStyleSheet("""
+            QDialog { background: #0f1923; color: #e6eef5; font-family: Inter, Segoe UI, Arial; }
+            QLabel { color: #e6eef5; background: transparent; }
+            QLineEdit {
+                background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06);
+                border-radius: 8px; padding: 10px 12px; color: #e6eef5; font-size: 13px;
+            }
+            QLineEdit:focus { border: 1px solid #ed3b3b; }
+            QPushButton {
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ed3b3b, stop:1 #c62e2e);
+                color: white; border-radius: 10px; padding: 10px 20px; font-size: 14px; font-weight: 600;
+            }
+            QPushButton:hover { background: #c62e2e; }
+            QPushButton#GhostBtn {
+                background: transparent; border: 1px solid rgba(255,255,255,0.15);
+                color: #98a0a6;
+            }
+            QPushButton#GhostBtn:hover { border: 1px solid #98a0a6; color: #e6eef5; }
+            QTextEdit {
+                background: #111a22; border: 1px solid #2a3a48; border-radius: 8px;
+                color: #e6eef5; font-size: 12px; font-family: Consolas, monospace;
+            }
+            """)
+        else:
+            self.setStyleSheet("""
+            QDialog { background: #f5f7fa; color: #1f2933; font-family: Inter, Segoe UI, Arial; }
+            QLabel { color: #111827; background: transparent; }
+            QLineEdit {
+                background: white; border: 1px solid #d1d5db;
+                border-radius: 8px; padding: 10px 12px; color: #111827; font-size: 13px;
+            }
+            QLineEdit:focus { border: 1px solid #ed3b3b; }
+            QPushButton {
+                background: #ed3b3b; color: white; border-radius: 10px;
+                padding: 10px 20px; font-size: 14px; font-weight: 600;
+            }
+            QPushButton:hover { background: #c62e2e; }
+            QPushButton#GhostBtn {
+                background: transparent; border: 1px solid #d1d5db; color: #6b7280;
+            }
+            QPushButton#GhostBtn:hover { border: 1px solid #6b7280; color: #111827; }
+            QTextEdit {
+                background: white; border: 1px solid #d1d5db; border-radius: 8px;
+                color: #111827; font-size: 12px; font-family: Consolas, monospace;
+            }
+            """)
+
+        tc = parent._theme_colors() if parent and hasattr(parent, "_theme_colors") else {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(0)
+
+        # --- Header ---
+        header = QLabel("Missing Sales Generator")
+        header.setStyleSheet("font-size: 18px; font-weight: 700;")
+        layout.addWidget(header)
+        layout.addSpacing(4)
+
+        subtitle = QLabel("Generate diagnostic SQL and helper scripts for missing POS sales")
+        subtitle.setStyleSheet("color: #6b7280; font-size: 12px;")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        layout.addSpacing(20)
+
+        # --- Divider ---
+        divider = QtWidgets.QFrame()
+        divider.setFixedHeight(1)
+        divider.setStyleSheet("background: rgba(255,255,255,0.08) if dark else #e5e7eb; border: none;")
+        divider.setStyleSheet(f"background: {'rgba(255,255,255,0.08)' if dark else '#e5e7eb'}; border: none;")
+        layout.addWidget(divider)
+        layout.addSpacing(16)
+
+        # --- Section: Terminal Info ---
+        section1 = QLabel("TERMINAL INFORMATION")
+        section1.setStyleSheet("color: #ed3b3b; font-size: 11px; font-weight: 700; letter-spacing: 1.5px;")
+        layout.addWidget(section1)
+        layout.addSpacing(12)
+
+        field_label_style = "color: #98a0a6; font-size: 12px; font-weight: 600;" if dark else "color: #374151; font-size: 12px; font-weight: 600;"
+
+        def make_field(label_text, widget):
+            block = QVBoxLayout()
+            block.setSpacing(5)
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet(field_label_style)
+            block.addWidget(lbl)
+            block.addWidget(widget)
+            return block
+
+        self.company_id = QLineEdit()
+        self.company_id.setPlaceholderText("WPOS-26012789")
+        self.terminal = QLineEdit()
+        self.terminal.setPlaceholderText("1 or 0001")
+        self.year = QLineEdit()
+        self.year.setPlaceholderText("YYYY")
+        self.month = QLineEdit()
+        self.month.setPlaceholderText("MM")
+
+        grid1 = QtWidgets.QGridLayout()
+        grid1.setHorizontalSpacing(16)
+        grid1.setVerticalSpacing(12)
+        grid1.addLayout(make_field("Company ID", self.company_id), 0, 0)
+        grid1.addLayout(make_field("Terminal", self.terminal), 0, 1)
+        grid1.addLayout(make_field("Missing Year", self.year), 1, 0)
+        grid1.addLayout(make_field("Missing Month", self.month), 1, 1)
+        layout.addLayout(grid1)
+
+        layout.addSpacing(20)
+
+        # --- Divider 2 ---
+        divider2 = QtWidgets.QFrame()
+        divider2.setFixedHeight(1)
+        divider2.setStyleSheet(f"background: {'rgba(255,255,255,0.08)' if dark else '#e5e7eb'}; border: none;")
+        layout.addWidget(divider2)
+        layout.addSpacing(16)
+
+        # --- Section: Connection ---
+        section2 = QLabel("CONNECTION")
+        section2.setStyleSheet("color: #ed3b3b; font-size: 11px; font-weight: 700; letter-spacing: 1.5px;")
+        layout.addWidget(section2)
+        layout.addSpacing(12)
+
+        self.link = QLineEdit()
+        self.link.setPlaceholderText("https://example.com")
+        layout.addLayout(make_field("Company Link", self.link))
+
+        layout.addSpacing(24)
+
+        # --- Buttons ---
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+
+        copy_btn = QPushButton("\U0001f4cb Copy")
+        copy_btn.setObjectName("GhostBtn")
+        copy_btn.setFixedHeight(40)
+        copy_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        copy_btn.clicked.connect(self.copy_to_clipboard)
+
+        self.generate_btn = QPushButton("Generate & Save")
+        self.generate_btn.setFixedHeight(40)
+        self.generate_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.generate_btn.clicked.connect(self.generate_and_save)
+
+        btn_layout.addStretch()
+        btn_layout.addWidget(copy_btn)
+        btn_layout.addWidget(self.generate_btn)
+        layout.addLayout(btn_layout)
+
+        layout.addSpacing(16)
+
+        # --- Preview ---
+        preview_label = QLabel("PREVIEW")
+        preview_label.setStyleSheet("color: #ed3b3b; font-size: 11px; font-weight: 700; letter-spacing: 1.5px;")
+        layout.addWidget(preview_label)
+        layout.addSpacing(8)
+
+        self.preview = QTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setMinimumHeight(100)
+        self.preview.setMaximumHeight(160)
+        self.preview.setPlaceholderText("Generated script will appear here...")
+        layout.addWidget(self.preview)
+
+    def _pad_terminal(self, terminal):
+        t = terminal.strip()
+        if len(t) == 1:
+            return "000" + t
+        elif len(t) == 2:
+            return "00" + t
+        elif len(t) == 3:
+            return "0" + t
+        return t
+
+    def _build_content(self):
+        cid = self.company_id.text().strip()
+        terminal = self._pad_terminal(self.terminal.text())
+        year = self.year.text().strip()
+        month = self.month.text().strip()
+        link = self.link.text().strip()
+        missing_date = year + month + "01"
+        missing_date2 = year + "1231"
+
+        lacking = (
+            'WITH LACKING:\n'
+            'SELECT fzcounter, fsale_date, MIN(fdocument_no) AS fmin, MAX(fdocument_no) AS fmax, '
+            'SUM(fgross) AS fgross, COUNT(fdocument_no) AS fdocument_no, '
+            'MAX(fdocument_no) - MIN(fdocument_no) + 1 AS Expected_OR_count, '
+            'count(*)-(max(fdocument_no)-min(fdocument_no)+1) as missing_OR '
+            'FROM pos_sale WHERE fcompanyid="' + cid + '" and ftermid="' + terminal + '" '
+            'AND fsale_date>="' + missing_date + '" AND fdocument_no <> 0 '
+            'GROUP BY fsale_date, fzcounter'
+        )
+
+        full_missing = (
+            '\n\nFULL MISSING SCRIPT:\n'
+            'select fsale_date, fzcounter, min(fdocument_no) as min_fdoc, max(fdocument_no) as max_fdoc, '
+            'count(*) as trxcnt,(max(fdocument_no) - min(fdocument_no) + 1) as expected, '
+            "case when count(*) = (max(fdocument_no) - min(fdocument_no) + 1) then 'Y' else 'N' end as same, "
+            'count(*) - (max(fdocument_no) - min(fdocument_no) + 1) as lacking, sum(fgross) as fgross '
+            'from pos_sale where fcompanyid="' + cid + '" AND ftermid="' + terminal + '" '
+            "and fsale_date >= '" + missing_date + "' and fsale_date <= '" + missing_date2 + "' "
+            "and fdocument_no <> '0' group by fsale_date, fzcounter having (same = 'N')"
+        )
+
+        excel = (
+            '\n\nFOR EXCEL:\n'
+            '=IF(E8-E7=1,"OK","MISSING")\n'
+            '=IF(E8 - E7 > 1, IF(E8-E7 > 2, E7 + 1 & "-" & E8 - 1, E8 -1), "OK")'
+        )
+
+        today = datetime.now().strftime("%Y%m%d")
+        select_or = (
+            '\n\nSELECT OR/DATE SCRIPT:\n'
+            'select * from pos_sale where fcompanyid="' + cid + '" and ftermid="' + terminal + '" '
+            "and fsale_date='" + today + "' and fzcounter='2251'"
+        )
+
+        update_frecno = (
+            '\n\nUPDATE FRECNO:\n'
+            "update pos_sale set fzcounter='' where fcompanyid='" + cid + "' "
+            "and ftermid='" + terminal + "' and fsale_date='date nga e set' and fzcounter='0'"
+        )
+
+        sql_delete = (
+            '\n\nSQL Query Delete:\n'
+            "DELETE from pos_sale where frecno not in ('', '', '',);\n"
+            "DELETE from pos_sale_payment where frecno not in ('', '', '',);\n"
+            "DELETE from pos_sale_product where frecno not in ('', '', '',);\n"
+            "DELETE from pos_reading;\nDELETE from pos_reading_summary;"
+        )
+
+        sql_update = (
+            '\n\nSQL Query Update:\n'
+            'UPDATE pos_sale_payment\n'
+            "SET frecno = \nCASE frecno\n    WHEN '' THEN ''\nELSE frecno\nEND;"
+        )
+
+        sql_transmit = (
+            '\n\nSQL Transmit:\n'
+            'update pos_sale set ftransmit="0000";\n'
+            'update pos_sale_payment set ftransmit="0000";\n'
+            'update pos_sale_product set ftransmit="0000";'
+        )
+
+        for_exception = '\n\nFOR EXCEPTION:\n' + link + '/appserv/app/batch/sys_get_exception.php'
+        for_bypass = '\n\nFOR BYPASS:\n' + link + '/appserv/app/batch/sys_bypass_exception.php/'
+        for_rereading = (
+            '\n\nFOR REREADING:\n' + link +
+            '/appserv/app/batch/fix/recreate_reading.php?fcompanyid=' + cid +
+            '&ftermid=' + terminal + '&fsale_date=&fzcounter=&fend_date=&fcreate_flag=1'
+        )
+
+        return lacking + full_missing + excel + select_or + update_frecno + sql_delete + sql_update + sql_transmit + for_exception + for_bypass + for_rereading
+
+    def _validate(self):
+        if not self.company_id.text().strip():
+            AppDialog("Validation Error", "Company ID cannot be empty.", self).exec()
+            return False
+        if not self.terminal.text().strip():
+            AppDialog("Validation Error", "Terminal cannot be empty.", self).exec()
+            return False
+        if not self.year.text().strip():
+            AppDialog("Validation Error", "Missing Year cannot be empty.", self).exec()
+            return False
+        if not self.month.text().strip():
+            AppDialog("Validation Error", "Missing Month cannot be empty.", self).exec()
+            return False
+        return True
+
+    def generate_and_save(self):
+        if not self._validate():
+            return
+        content = self._build_content()
+        self.preview.setPlainText(content)
+
+        today_folder = datetime.now().strftime("%m-%d-%Y")
+        os.makedirs(today_folder, exist_ok=True)
+        default_path = os.path.join(today_folder, "Script.txt")
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Script", default_path, "Text Files (*.txt);;All Files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            logger.info("Missing Sales script saved: %s", path)
+            AppDialog("Success", f"Script saved to:\n{path}", self).exec()
+        except Exception:
+            logger.exception("Failed to save Missing Sales script")
+            AppDialog("Error", "Failed to save script. Check logs.", self).exec()
+
+    def copy_to_clipboard(self):
+        if not self._validate():
+            return
+        content = self._build_content()
+        self.preview.setPlainText(content)
+        QtWidgets.QApplication.clipboard().setText(content)
+        self.preview.append("\n--- Copied to clipboard ---")
 
 
 # ================= MAIN WINDOW =================
@@ -2460,7 +2774,7 @@ class LoginWindow(QtWidgets.QWidget):
         """Create a compact horizontal row for a single tool."""
         row = QtWidgets.QFrame()
         row.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        row.setFixedHeight(56)
+        row.setMinimumHeight(56)
         row.setStyleSheet(f"""
             QFrame {{
                 background-color: {tc['field_bg']};
@@ -2534,8 +2848,8 @@ class LoginWindow(QtWidgets.QWidget):
     # The handler name must match the "handler" key in TOOL_REGISTRY.
 
     def run_tool_1(self):
-        """Tool 1 — TODO: implement"""
-        AppDialog("Tool 1", "Tool 1 is not yet implemented.", self).exec()
+        dialog = MissingSalesDialog(self)
+        dialog.exec()
 
     def run_tool_2(self):
         """Tool 2 — TODO: implement"""
