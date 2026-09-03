@@ -44,7 +44,7 @@ collection_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection"
 template_path = "Report Template.docx"
 
 # ================= AUTO-UPDATE CONFIG =================
-APP_VERSION = "3.0.3"
+APP_VERSION = "3.0.4"
 GITHUB_REPO = "shinispades/AutoReport"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -306,16 +306,19 @@ def _download_update(download_url, progress_callback=None):
 def _apply_zip_update(zip_path):
     """
     Extract a zip update and replace files in the current app directory.
+    Locked files (e.g. the running exe) are staged as .new and swapped
+    by a batch script after the app exits.
     Returns True on success, False on failure.
     """
     import zipfile
     import shutil
 
-    # Determine the app directory (where the exe or script lives)
     if getattr(sys, 'frozen', False):
         app_dir = os.path.dirname(sys.executable)
+        exe_name = os.path.basename(sys.executable)
     else:
         app_dir = os.path.dirname(os.path.abspath(__file__))
+        exe_name = None
 
     logger.info("Applying zip update: %s -> %s", zip_path, app_dir)
 
@@ -331,17 +334,53 @@ def _apply_zip_update(zip_path):
 
         # Copy extracted files over the app directory
         copied = 0
+        locked_files = []
         for item in os.listdir(extract_dir):
             src = os.path.join(extract_dir, item)
             dst = os.path.join(app_dir, item)
-            if os.path.isdir(src):
-                if os.path.exists(dst):
-                    shutil.rmtree(dst)
-                shutil.copytree(src, dst)
-            else:
-                shutil.copy2(src, dst)
-            copied += 1
-            logger.debug("Replaced: %s", dst)
+            try:
+                if os.path.isdir(src):
+                    if os.path.exists(dst):
+                        shutil.rmtree(dst)
+                    shutil.copytree(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+                copied += 1
+                logger.debug("Replaced: %s", dst)
+            except PermissionError:
+                # File is locked (likely the running exe) — stage as .new
+                staged = dst + ".new"
+                try:
+                    # Remove stale .new file from a previous failed update
+                    if os.path.exists(staged):
+                        os.remove(staged)
+                except OSError:
+                    logger.warning("Could not remove stale .new file: %s", staged)
+                try:
+                    shutil.copy2(src, staged)
+                    locked_files.append((staged, dst))
+                    copied += 1
+                    logger.info("Staged locked file: %s -> %s", src, staged)
+                except Exception:
+                    logger.exception("Failed to stage locked file: %s -> %s", src, staged)
+
+        # If there are locked files, create a batch script to swap them after exit
+        if locked_files:
+            bat_path = os.path.join(app_dir, "_update_swap.bat")
+            pid = os.getpid()
+            lines = [
+                "@echo off",
+                f"taskkill /PID {pid} /F >nul 2>&1",
+                "timeout /t 2 /nobreak >nul",
+            ]
+            for staged, dst in locked_files:
+                lines.append(f'del /f /q "{dst}" 2>nul')
+                lines.append(f'rename "{staged}" "{os.path.basename(dst)}"')
+            lines.append(f'del /f /q "{bat_path}" 2>nul')
+            lines.append(f'start "" "{os.path.join(app_dir, exe_name or "report.py")}"')
+            with open(bat_path, "w") as f:
+                f.write("\n".join(lines))
+            logger.info("Created update swap script: %s", bat_path)
 
         # Cleanup
         shutil.rmtree(extract_dir, ignore_errors=True)
@@ -764,10 +803,24 @@ class UpdateDialog(QtWidgets.QDialog):
     def _restart_app(self):
         """Restart the application after a zip update."""
         import subprocess
+
         if getattr(sys, 'frozen', False):
-            exe = sys.executable
+            app_dir = os.path.dirname(sys.executable)
         else:
-            exe = sys.executable
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+
+        bat_path = os.path.join(app_dir, "_update_swap.bat")
+
+        # If a swap script exists (locked files), just quit — the bat handles restart
+        if os.path.isfile(bat_path):
+            logger.info("Swap script found, launching: %s", bat_path)
+            subprocess.Popen(["cmd", "/c", bat_path], shell=False,
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+            QtWidgets.QApplication.quit()
+            return
+
+        # No locked files — restart directly
+        exe = sys.executable
         logger.info("Restarting: %s %s", exe, sys.argv)
         try:
             subprocess.Popen([exe] + sys.argv)
