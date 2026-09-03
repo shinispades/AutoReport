@@ -44,9 +44,125 @@ collection_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection"
 template_path = "Report Template.docx"
 
 # ================= AUTO-UPDATE CONFIG =================
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.3"
 GITHUB_REPO = "shinispades/AutoReport"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+
+
+# ================= TOOL REGISTRY =================
+# To add a new tool, append a dict to this list:
+#   {
+#       "id": "unique_tool_id",          # unique identifier
+#       "name": "Display Name",          # shown on the card
+#       "description": "Short desc...",  # shown on the card
+#       "icon": "🔧",                    # emoji or text icon
+#       "handler": "method_name",        # method name on LoginWindow to call
+#       "category": "General",           # optional category for grouping
+#   }
+# Then implement the handler method on LoginWindow.
+# The Tools page auto-fetches all tools from this list.
+
+TOOL_REGISTRY = [
+    # --- Tool 1 ---
+    {
+        "id": "tool_1",
+        "name": "Tool 1",
+        "description": "Description for Tool 1",
+        "icon": "🔧",
+        "handler": "run_tool_1",
+        "category": "General",
+    },
+    # --- Tool 2 ---
+    {
+        "id": "tool_2",
+        "name": "Tool 2",
+        "description": "Description for Tool 2",
+        "icon": "📊",
+        "handler": "run_tool_2",
+        "category": "General",
+    },
+    # --- Tool 3 ---
+    {
+        "id": "tool_3",
+        "name": "Tool 3",
+        "description": "Description for Tool 3",
+        "icon": "📁",
+        "handler": "run_tool_3",
+        "category": "Reports",
+    },
+    # --- Tool 4 ---
+    {
+        "id": "tool_4",
+        "name": "Tool 4",
+        "description": "Description for Tool 4",
+        "icon": "🔍",
+        "handler": "run_tool_4",
+        "category": "Reports",
+    },
+    # --- Tool 5 ---
+    {
+        "id": "tool_5",
+        "name": "Tool 5",
+        "description": "Description for Tool 5",
+        "icon": "⚙️",
+        "handler": "run_tool_5",
+        "category": "Utilities",
+    },
+    # --- Tool 6 ---
+    {
+        "id": "tool_6",
+        "name": "Tool 6",
+        "description": "Description for Tool 6",
+        "icon": "📝",
+        "handler": "run_tool_6",
+        "category": "Utilities",
+    },
+    # --- Tool 7 ---
+    {
+        "id": "tool_7",
+        "name": "Tool 7",
+        "description": "Description for Tool 7",
+        "icon": "🗂️",
+        "handler": "run_tool_7",
+        "category": "Utilities",
+    },
+    # --- Tool 8 ---
+    {
+        "id": "tool_8",
+        "name": "Tool 8",
+        "description": "Description for Tool 8",
+        "icon": "📈",
+        "handler": "run_tool_8",
+        "category": "Analytics",
+    },
+    # --- Tool 9 ---
+    {
+        "id": "tool_9",
+        "name": "Tool 9",
+        "description": "Description for Tool 9",
+        "icon": "🛠️",
+        "handler": "run_tool_9",
+        "category": "Analytics",
+    },
+    # --- Tool 10 ---
+    {
+        "id": "tool_10",
+        "name": "Tool 10",
+        "description": "Description for Tool 10",
+        "icon": "📦",
+        "handler": "run_tool_10",
+        "category": "Analytics",
+    },
+    # === ADD MORE TOOLS BELOW ===
+    # {
+    #     "id": "my_new_tool",
+    #     "name": "My New Tool",
+    #     "description": "What it does",
+    #     "icon": "✨",
+    #     "handler": "run_my_new_tool",
+    #     "category": "General",
+    # },
+]
 
 
 def _fetch_pat_expiry(pat):
@@ -1835,7 +1951,7 @@ class LoginWindow(QtWidgets.QWidget):
 
     def show_main_menu_page(self):
         self.clear_layout()
-        self.set_page_size(460, 560)
+        self.set_page_size(460, 620)
 
         card = QtWidgets.QWidget()
         card.setObjectName("Card")
@@ -1934,6 +2050,30 @@ class LoginWindow(QtWidgets.QWidget):
             }}
         """)
         layout.addWidget(pot_btn)
+
+        layout.addSpacing(12)
+
+        # --- Tertiary action: Tools (outlined style) ---
+        tools_btn = QtWidgets.QPushButton("Tools")
+        tools_btn.setFixedHeight(46)
+        tools_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        tools_btn.clicked.connect(self.show_tools_page)
+        tools_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: 1.5px solid {tc['outline_border']};
+                border-radius: 10px;
+                padding: 12px;
+                font-size: 15px;
+                font-weight: 600;
+                color: {tc['outline_text']};
+            }}
+            QPushButton:hover {{
+                border: 1.5px solid {tc['outline_hover_border']};
+                color: {tc['outline_hover_text']};
+            }}
+        """)
+        layout.addWidget(tools_btn)
 
         # --- Footer: signed in as ---
         if hasattr(self, "current_user") and self.current_user.get("display_name"):
@@ -2131,6 +2271,249 @@ class LoginWindow(QtWidgets.QWidget):
         except Exception:
             logger.exception("Failed to save PAT expiry")
             self.settings_status.setText("Failed to save. Check logs.")
+
+
+    # ================= TOOLS PAGE =================
+    def show_tools_page(self):
+        self.clear_layout()
+        self.set_page_size(480, 620)
+
+        tc = self._theme_colors()
+
+        outer = QtWidgets.QVBoxLayout()
+        outer.setContentsMargins(24, 20, 24, 20)
+        outer.setSpacing(0)
+
+        # --- Top Bar (Back Arrow) ---
+        top_bar = QtWidgets.QHBoxLayout()
+        back_btn = QtWidgets.QToolButton()
+        back_btn.setText("←")
+        back_btn.setToolTip("Back to Main Menu")
+        back_btn.clicked.connect(self.show_main_menu_page)
+        back_btn.setStyleSheet(f"""
+            QToolButton {{
+                border: none;
+                font-size: 18px;
+                font-weight: bold;
+                color: {tc['back_color']};
+            }}
+            QToolButton:hover {{
+                color: {tc['back_hover']};
+            }}
+        """)
+        back_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        top_bar.addWidget(back_btn)
+        top_bar.addStretch()
+        outer.addLayout(top_bar)
+        outer.addSpacing(4)
+
+        # --- Title ---
+        title = QtWidgets.QLabel("Tools")
+        title.setObjectName("Title")
+        outer.addWidget(title)
+        outer.addSpacing(2)
+
+        subtitle = QtWidgets.QLabel(f"{len(TOOL_REGISTRY)} tools available")
+        subtitle.setObjectName("Subtitle")
+        outer.addWidget(subtitle)
+        outer.addSpacing(12)
+
+        # --- Search bar ---
+        self.tools_search = QtWidgets.QLineEdit()
+        self.tools_search.setPlaceholderText("Search tools...")
+        self.tools_search.setClearButtonEnabled(True)
+        self.tools_search.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {tc['field_bg']};
+                border: 1px solid {tc['field_border']};
+                border-radius: 8px;
+                padding: 8px 10px;
+                color: {tc['field_text']};
+                font-size: 13px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {tc['field_focus_border']};
+            }}
+        """)
+        outer.addWidget(self.tools_search)
+        outer.addSpacing(12)
+
+        # --- Scrollable list ---
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet("""
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { width: 5px; background: transparent; }
+            QScrollBar::handle:vertical { background: rgba(128,128,128,0.3); border-radius: 2px; min-height: 20px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+
+        scroll_widget = QtWidgets.QWidget()
+        scroll_widget.setStyleSheet("background: transparent;")
+        self.tools_list_layout = QtWidgets.QVBoxLayout(scroll_widget)
+        self.tools_list_layout.setSpacing(6)
+        self.tools_list_layout.setContentsMargins(2, 2, 2, 2)
+
+        self._populate_tools_list(tc)
+
+        scroll_area.setWidget(scroll_widget)
+        outer.addWidget(scroll_area)
+
+        container = QtWidgets.QWidget()
+        container.setLayout(outer)
+        self.main_layout.addWidget(container)
+
+        # --- Connect search to filter ---
+        self.tools_search.textChanged.connect(lambda text: self._filter_tools(text, tc))
+
+    def _populate_tools_list(self, tc, filter_text=""):
+        """Populate the tools list from TOOL_REGISTRY. Auto-fetches all tools."""
+        while self.tools_list_layout.count():
+            item = self.tools_list_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        found = 0
+        for tool in TOOL_REGISTRY:
+            if filter_text.lower() not in tool["name"].lower() and \
+               filter_text.lower() not in tool.get("description", "").lower() and \
+               filter_text.lower() not in tool.get("category", "").lower():
+                continue
+
+            row = self._create_tool_row(tool, tc)
+            self.tools_list_layout.addWidget(row)
+            found += 1
+
+        if found == 0:
+            no_results = QtWidgets.QLabel("No tools found")
+            no_results.setStyleSheet(f"color: {tc['back_color']}; font-size: 13px; padding: 20px;")
+            no_results.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.tools_list_layout.addWidget(no_results)
+
+        self.tools_list_layout.addStretch()
+
+    def _filter_tools(self, text, tc):
+        """Re-populate list when search text changes."""
+        self._populate_tools_list(tc, filter_text=text)
+
+    def _create_tool_row(self, tool, tc):
+        """Create a compact horizontal row for a single tool."""
+        row = QtWidgets.QFrame()
+        row.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        row.setFixedHeight(56)
+        row.setStyleSheet(f"""
+            QFrame {{
+                background-color: {tc['field_bg']};
+                border: 1px solid {tc['field_border']};
+                border-radius: 8px;
+            }}
+            QFrame:hover {{
+                border: 1px solid {tc['field_focus_border']};
+            }}
+        """)
+
+        row_layout = QtWidgets.QHBoxLayout(row)
+        row_layout.setContentsMargins(14, 8, 14, 8)
+        row_layout.setSpacing(12)
+
+        # Icon
+        icon_label = QtWidgets.QLabel(tool.get("icon", "🔧"))
+        icon_label.setFixedWidth(28)
+        icon_label.setStyleSheet("font-size: 18px; background: transparent; border: none;")
+        row_layout.addWidget(icon_label)
+
+        # Text block (name + description stacked)
+        text_block = QtWidgets.QVBoxLayout()
+        text_block.setSpacing(2)
+
+        name_label = QtWidgets.QLabel(tool["name"])
+        name_label.setStyleSheet(f"""
+            font-size: 13px; font-weight: 600; color: {tc['field_text']};
+            background: transparent; border: none;
+        """)
+        text_block.addWidget(name_label)
+
+        desc_label = QtWidgets.QLabel(tool.get("description", ""))
+        desc_label.setStyleSheet(f"""
+            font-size: 11px; color: {tc['back_color']};
+            background: transparent; border: none;
+        """)
+        desc_label.setWordWrap(True)
+        text_block.addWidget(desc_label)
+
+        row_layout.addLayout(text_block, stretch=1)
+
+        # Arrow indicator
+        arrow = QtWidgets.QLabel("›")
+        arrow.setStyleSheet(f"""
+            font-size: 18px; color: {tc['back_color']};
+            background: transparent; border: none;
+        """)
+        row_layout.addWidget(arrow)
+
+        # Click handler
+        handler_name = tool.get("handler", "")
+        row.mousePressEvent = lambda event, h=handler_name: self._on_tool_clicked(h)
+
+        return row
+
+    def _on_tool_clicked(self, handler_name):
+        """Dispatch to the tool's handler method on this window."""
+        if not handler_name:
+            AppDialog("Coming Soon", "This tool is not yet implemented.", self).exec()
+            return
+        handler = getattr(self, handler_name, None)
+        if handler and callable(handler):
+            logger.info("Tool clicked: %s", handler_name)
+            handler()
+        else:
+            AppDialog("Error", f"Handler '{handler_name}' not found.", self).exec()
+
+    # ================= TOOL HANDLERS =================
+    # Implement each tool's logic below.
+    # The handler name must match the "handler" key in TOOL_REGISTRY.
+
+    def run_tool_1(self):
+        """Tool 1 — TODO: implement"""
+        AppDialog("Tool 1", "Tool 1 is not yet implemented.", self).exec()
+
+    def run_tool_2(self):
+        """Tool 2 — TODO: implement"""
+        AppDialog("Tool 2", "Tool 2 is not yet implemented.", self).exec()
+
+    def run_tool_3(self):
+        """Tool 3 — TODO: implement"""
+        AppDialog("Tool 3", "Tool 3 is not yet implemented.", self).exec()
+
+    def run_tool_4(self):
+        """Tool 4 — TODO: implement"""
+        AppDialog("Tool 4", "Tool 4 is not yet implemented.", self).exec()
+
+    def run_tool_5(self):
+        """Tool 5 — TODO: implement"""
+        AppDialog("Tool 5", "Tool 5 is not yet implemented.", self).exec()
+
+    def run_tool_6(self):
+        """Tool 6 — TODO: implement"""
+        AppDialog("Tool 6", "Tool 6 is not yet implemented.", self).exec()
+
+    def run_tool_7(self):
+        """Tool 7 — TODO: implement"""
+        AppDialog("Tool 7", "Tool 7 is not yet implemented.", self).exec()
+
+    def run_tool_8(self):
+        """Tool 8 — TODO: implement"""
+        AppDialog("Tool 8", "Tool 8 is not yet implemented.", self).exec()
+
+    def run_tool_9(self):
+        """Tool 9 — TODO: implement"""
+        AppDialog("Tool 9", "Tool 9 is not yet implemented.", self).exec()
+
+    def run_tool_10(self):
+        """Tool 10 — TODO: implement"""
+        AppDialog("Tool 10", "Tool 10 is not yet implemented.", self).exec()
 
 
     def show_login(self):
