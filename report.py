@@ -44,8 +44,8 @@ collection_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection"
 template_path = "Report Template.docx"
 
 # ================= AUTO-UPDATE CONFIG =================
-APP_VERSION = "3.5.0"
-GITHUB_REPO = "YOUR_USERNAME/report-app"  # <-- Change this to your GitHub username/repo
+APP_VERSION = "3.0.0"
+GITHUB_REPO = "shinispades/AutoReport"  # <-- Change this to your GitHub username/repo
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 
