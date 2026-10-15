@@ -26,6 +26,9 @@ import pytz
 import pyrebase
 import firebase_admin
 from firebase_admin import credentials, firestore
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
 
 
 # ================= LOGGING SETUP =================
@@ -45,7 +48,7 @@ collection_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection"
 template_path = "Report Template.docx"
 
 # ================= AUTO-UPDATE CONFIG =================
-APP_VERSION = "3.0.6"
+APP_VERSION = "3.0.7"
 GITHUB_REPO = "shinispades/AutoReport"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -73,14 +76,14 @@ TOOL_REGISTRY = [
         "handler": "run_tool_1",
         "category": "Reports",
     },
-    # --- Tool 2 ---
+    # --- Tool 2: Ayala Checker ---
     {
         "id": "tool_2",
-        "name": "Tool 2",
-        "description": "Description for Tool 2",
+        "name": "Ayala Checker",
+        "description": "Compare hourly sales CSVs against EOD CSV and generate organized Excel report",
         "icon": "📊",
         "handler": "run_tool_2",
-        "category": "General",
+        "category": "Reports",
     },
     # --- Tool 3 ---
     {
@@ -330,68 +333,142 @@ def _apply_zip_update(zip_path):
         os.makedirs(extract_dir)
 
         with zipfile.ZipFile(zip_path, 'r') as zf:
+            members = zf.namelist()
+            root_real = os.path.realpath(extract_dir)
+            for name in members:
+                member_real = os.path.realpath(os.path.join(extract_dir, name))
+                if member_real != root_real and not member_real.startswith(root_real + os.sep):
+                    logger.error("Rejecting unsafe zip member: %r", name)
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+                    return False
             zf.extractall(extract_dir)
-            logger.info("Extracted %d files from zip", len(zf.namelist()))
+            logger.info("Extracted %d member(s) from zip", len(members))
 
-        # Copy extracted files over the app directory
+        # Some release zips wrap everything in a single top-level folder.
+        # Descend into it so the payload lands in the app directory itself.
+        payload_dir = extract_dir
+        entries = os.listdir(payload_dir)
+        while len(entries) == 1 and os.path.isdir(os.path.join(payload_dir, entries[0])):
+            payload_dir = os.path.join(payload_dir, entries[0])
+            entries = os.listdir(payload_dir)
+        logger.info("Update payload root: %s (%d top-level item(s))", payload_dir, len(entries))
+
         copied = 0
         locked_files = []
-        for item in os.listdir(extract_dir):
-            src = os.path.join(extract_dir, item)
+        for item in entries:
+            src_item = os.path.join(payload_dir, item)
             dst = os.path.join(app_dir, item)
             try:
-                if os.path.isdir(src):
+                if os.path.isdir(src_item):
                     if os.path.exists(dst):
                         shutil.rmtree(dst)
-                    shutil.copytree(src, dst)
+                    shutil.copytree(src_item, dst)
                 else:
-                    shutil.copy2(src, dst)
+                    shutil.copy2(src_item, dst)
                 copied += 1
                 logger.debug("Replaced: %s", dst)
             except PermissionError:
-                # File is locked (likely the running exe) — stage as .new
+                # File is locked (most likely the running exe) - stage as .new
                 staged = dst + ".new"
                 try:
-                    # Remove stale .new file from a previous failed update
                     if os.path.exists(staged):
                         os.remove(staged)
                 except OSError:
                     logger.warning("Could not remove stale .new file: %s", staged)
                 try:
-                    shutil.copy2(src, staged)
+                    shutil.copy2(src_item, staged)
                     locked_files.append((staged, dst))
                     copied += 1
-                    logger.info("Staged locked file: %s -> %s", src, staged)
+                    logger.info("Staged locked file: %s -> %s", src_item, staged)
                 except Exception:
-                    logger.exception("Failed to stage locked file: %s -> %s", src, staged)
+                    logger.exception("Failed to stage locked file: %s -> %s", src_item, staged)
 
-        # If there are locked files, create a batch script to swap them after exit
+        # Re-stage any .new file left over from an earlier attempt so the
+        # swap script retries it instead of leaving it behind forever.
+        for item in entries:
+            dst = os.path.join(app_dir, item)
+            staged = dst + ".new"
+            if os.path.isfile(staged) and (staged, dst) not in locked_files:
+                locked_files.append((staged, dst))
+
         if locked_files:
             bat_path = os.path.join(app_dir, "_update_swap.bat")
-            pid = os.getpid()
-            lines = [
-                "@echo off",
-                f"taskkill /PID {pid} /F >nul 2>&1",
-                "timeout /t 2 /nobreak >nul",
-            ]
-            for staged, dst in locked_files:
-                lines.append(f'del /f /q "{dst}" 2>nul')
-                lines.append(f'rename "{staged}" "{os.path.basename(dst)}"')
-            lines.append(f'del /f /q "{bat_path}" 2>nul')
-            lines.append(f'start "" "{os.path.join(app_dir, exe_name or "report.py")}"')
-            with open(bat_path, "w") as f:
-                f.write("\n".join(lines))
-            logger.info("Created update swap script: %s", bat_path)
+            _write_swap_script(bat_path, app_dir, exe_name, locked_files)
+            logger.info("Created update swap script for %d locked file(s): %s",
+                        len(locked_files), bat_path)
 
-        # Cleanup
         shutil.rmtree(extract_dir, ignore_errors=True)
-        os.remove(zip_path)
-        logger.info("Zip update applied: %d item(s) replaced", copied)
+        try:
+            os.remove(zip_path)
+        except OSError:
+            logger.warning("Could not remove downloaded update: %s", zip_path)
+        logger.info("Zip update applied: %d item(s) processed, %d locked",
+                    copied, len(locked_files))
         return True
 
     except Exception:
         logger.exception("Failed to apply zip update")
         return False
+
+
+def _write_swap_script(bat_path, app_dir, exe_name, locked_files):
+    """
+    Write the batch script that replaces locked files after the app exits.
+
+    cmd.exe quirks handled here:
+      * CRLF line endings - LF-only .bat files are parsed unreliably.
+      * Delays use `ping`, because `timeout` errors out with no console.
+      * One `:replace` subroutine is `call`ed per file - batch labels must
+        be unique, so a retry loop cannot be inlined more than once.
+    """
+    pid = os.getpid()
+    target = os.path.join(app_dir, exe_name or "report.py")
+
+    lines = [
+        "@echo off",
+        "rem AutoReport update swap script",
+        'set "PID=%s"' % pid,
+        "",
+        "rem --- wait up to ~40s for the running app to exit ---",
+        "set _tries=0",
+        ":waitloop",
+        'tasklist /nh /fi "PID eq %PID%" 2>nul | find /i "%PID%" >nul',
+        "if errorlevel 1 goto swap",
+        "set /a _tries=%_tries%+1",
+        "if %_tries% geq 20 goto forcekill",
+        "ping -n 2 127.0.0.1 >nul",
+        "goto waitloop",
+        ":forcekill",
+        "taskkill /f /pid %PID% >nul 2>&1",
+        "",
+        ":swap",
+        "rem --- give the OS a moment to release file handles ---",
+        "ping -n 3 127.0.0.1 >nul",
+    ]
+    for staged, dst in locked_files:
+        lines.append('call :replace "%s" "%s"' % (staged, dst))
+    lines += [
+        "",
+        'start "" "%s"' % target,
+        "exit /b 0",
+        "",
+        "rem --- replace one file, retrying while it stays locked ---",
+        ":replace",
+        "set _rtries=0",
+        ":replace_loop",
+        'move /y "%~1" "%~2" >nul 2>&1',
+        'if not exist "%~1" exit /b 0',
+        "set /a _rtries=%_rtries%+1",
+        "if %_rtries% geq 20 exit /b 1",
+        "ping -n 2 127.0.0.1 >nul",
+        "goto replace_loop",
+    ]
+
+    data = "\r\n".join(lines) + "\r\n"
+    with open(bat_path, "w", encoding="mbcs", newline="") as f:
+        f.write(data)
+    logger.info("Wrote swap script (%d file(s) to replace): %s",
+                len(locked_files), bat_path)
 
 
 # Firebase — lazy initialized on first use so the UI appears instantly
@@ -815,7 +892,7 @@ class UpdateDialog(QtWidgets.QDialog):
         # If a swap script exists (locked files), just quit — the bat handles restart
         if os.path.isfile(bat_path):
             logger.info("Swap script found, launching: %s", bat_path)
-            subprocess.Popen(["cmd", "/c", bat_path], shell=False,
+            subprocess.Popen(["cmd", "/c", bat_path], shell=False, cwd=app_dir,
                              creationflags=subprocess.CREATE_NO_WINDOW)
             QtWidgets.QApplication.quit()
             return
@@ -1392,6 +1469,588 @@ class MissingSalesDialog(QDialog):
         self.preview.setPlainText(content)
         QtWidgets.QApplication.clipboard().setText(content)
         self.preview.append("\n--- Copied to clipboard ---")
+
+
+class AyalaCheckerDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Ayala Checker")
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(600)
+
+        dark = is_windows_dark_mode()
+        if dark:
+            self.setStyleSheet("""
+            QDialog { background: #0f1923; color: #e6eef5; font-family: Inter, Segoe UI, Arial; }
+            QLabel { color: #e6eef5; background: transparent; }
+            QLineEdit {
+                background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06);
+                border-radius: 8px; padding: 10px 12px; color: #e6eef5; font-size: 13px;
+            }
+            QLineEdit:focus { border: 1px solid #ed3b3b; }
+            QPushButton {
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ed3b3b, stop:1 #c62e2e);
+                color: white; border-radius: 10px; padding: 10px 20px; font-size: 14px; font-weight: 600;
+            }
+            QPushButton:hover { background: #c62e2e; }
+            QPushButton#GhostBtn {
+                background: transparent; border: 1px solid rgba(255,255,255,0.15);
+                color: #98a0a6;
+            }
+            QPushButton#GhostBtn:hover { border: 1px solid #98a0a6; color: #e6eef5; }
+            QTextEdit {
+                background: #111a22; border: 1px solid #2a3a48; border-radius: 8px;
+                color: #e6eef5; font-size: 12px; font-family: Consolas, monospace;
+            }
+            """)
+        else:
+            self.setStyleSheet("""
+            QDialog { background: #f5f7fa; color: #1f2933; font-family: Inter, Segoe UI, Arial; }
+            QLabel { color: #111827; background: transparent; }
+            QLineEdit {
+                background: white; border: 1px solid #d1d5db;
+                border-radius: 8px; padding: 10px 12px; color: #111827; font-size: 13px;
+            }
+            QLineEdit:focus { border: 1px solid #ed3b3b; }
+            QPushButton {
+                background: #ed3b3b; color: white; border-radius: 10px;
+                padding: 10px 20px; font-size: 14px; font-weight: 600;
+            }
+            QPushButton:hover { background: #c62e2e; }
+            QPushButton#GhostBtn {
+                background: transparent; border: 1px solid #d1d5db; color: #6b7280;
+            }
+            QPushButton#GhostBtn:hover { border: 1px solid #6b7280; color: #111827; }
+            QTextEdit {
+                background: white; border: 1px solid #d1d5db; border-radius: 8px;
+                color: #111827; font-size: 12px; font-family: Consolas, monospace;
+            }
+            """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(0)
+
+        # --- Header ---
+        header = QLabel("Ayala Checker")
+        header.setStyleSheet("font-size: 18px; font-weight: 700;")
+        layout.addWidget(header)
+        layout.addSpacing(4)
+
+        subtitle = QLabel("Compare hourly sales CSVs against EOD CSV and generate organized Excel report")
+        subtitle.setStyleSheet("color: #6b7280; font-size: 12px;")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        layout.addSpacing(20)
+
+        # --- Divider ---
+        divider = QtWidgets.QFrame()
+        divider.setFixedHeight(1)
+        divider.setStyleSheet(f"background: {'rgba(255,255,255,0.08)' if dark else '#e5e7eb'}; border: none;")
+        layout.addWidget(divider)
+        layout.addSpacing(16)
+
+        # --- Section: Folder Selection ---
+        section1 = QLabel("FOLDER SELECTION")
+        section1.setStyleSheet("color: #ed3b3b; font-size: 11px; font-weight: 700; letter-spacing: 1.5px;")
+        layout.addWidget(section1)
+        layout.addSpacing(12)
+
+        field_label_style = "color: #98a0a6; font-size: 12px; font-weight: 600;" if dark else "color: #374151; font-size: 12px; font-weight: 600;"
+
+        def make_field(label_text, widget):
+            block = QVBoxLayout()
+            block.setSpacing(5)
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet(field_label_style)
+            block.addWidget(lbl)
+            block.addWidget(widget)
+            return block
+
+        # Folder path input with browse button
+        folder_label = QLabel("Tenant Data Folder")
+        folder_label.setStyleSheet(field_label_style)
+        layout.addWidget(folder_label)
+        layout.addSpacing(5)
+
+        folder_layout = QHBoxLayout()
+        self.folder_path = QLineEdit()
+        self.folder_path.setPlaceholderText("Select folder containing CSV files...")
+        self.folder_path.setReadOnly(True)
+        folder_layout.addWidget(self.folder_path)
+
+        browse_btn = QPushButton("Browse")
+        browse_btn.setObjectName("GhostBtn")
+        browse_btn.setFixedHeight(40)
+        browse_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        browse_btn.clicked.connect(self.browse_folder)
+        folder_layout.addWidget(browse_btn)
+
+        layout.addLayout(folder_layout)
+        layout.addSpacing(10)
+
+        # Output file name
+        self.output_name = QLineEdit()
+        self.output_name.setPlaceholderText("Output filename (e.g., Ayala_Report.xlsx)")
+        self.output_name.setText("Ayala_Report.xlsx")
+        layout.addLayout(make_field("Output Filename", self.output_name))
+
+        layout.addSpacing(20)
+
+        # --- Divider 2 ---
+        divider2 = QtWidgets.QFrame()
+        divider2.setFixedHeight(1)
+        divider2.setStyleSheet(f"background: {'rgba(255,255,255,0.08)' if dark else '#e5e7eb'}; border: none;")
+        layout.addWidget(divider2)
+        layout.addSpacing(16)
+
+        # --- Buttons ---
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+
+        self.generate_btn = QPushButton("Generate Report")
+        self.generate_btn.setFixedHeight(40)
+        self.generate_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.generate_btn.clicked.connect(self.generate_report)
+
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.generate_btn)
+        layout.addLayout(btn_layout)
+
+        layout.addSpacing(16)
+
+        # --- Log Area ---
+        log_label = QLabel("PROCESSING LOG")
+        log_label.setStyleSheet("color: #ed3b3b; font-size: 11px; font-weight: 700; letter-spacing: 1.5px;")
+        layout.addWidget(log_label)
+        layout.addSpacing(8)
+
+        self.log_area = QTextEdit()
+        self.log_area.setReadOnly(True)
+        self.log_area.setMinimumHeight(150)
+        self.log_area.setPlaceholderText("Processing log will appear here...")
+        layout.addWidget(self.log_area)
+
+    def browse_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Select Tenant Data Folder"
+        )
+        if folder:
+            self.folder_path.setText(folder)
+            logger.info("Ayala Checker: Selected folder: %s", folder)
+
+    def log(self, message):
+        self.log_area.append(message)
+        QtWidgets.QApplication.processEvents()
+
+    def generate_report(self):
+        folder = self.folder_path.text().strip()
+        if not folder:
+            AppDialog("Error", "Please select a folder first.", self).exec()
+            return
+
+        if not os.path.isdir(folder):
+            AppDialog("Error", "Selected folder does not exist.", self).exec()
+            return
+
+        self.generate_btn.setEnabled(False)
+        self.generate_btn.setText("Processing...")
+        QtWidgets.QApplication.processEvents()
+
+        try:
+            self.log("Starting Ayala Checker processing...")
+            self.log(f"Folder: {folder}")
+
+            # Find all CSV files
+            csv_files = [f for f in os.listdir(folder) if f.endswith('.csv')]
+            self.log(f"Found {len(csv_files)} CSV file(s)")
+
+            # Separate hourly sales and EOD files
+            hourly_files = []
+            eod_file = None
+
+            for csv_file in csv_files:
+                if csv_file.startswith('EOD'):
+                    eod_file = csv_file
+                else:
+                    hourly_files.append(csv_file)
+
+            # Sort hourly files by transaction number
+            hourly_files.sort(key=lambda x: int(x.split('_')[-1].replace('.csv', '')))
+
+            self.log(f"Hourly sales files: {len(hourly_files)}")
+            self.log(f"EOD file: {eod_file if eod_file else 'Not found'}")
+
+            if not hourly_files:
+                AppDialog("Error", "No hourly sales CSV files found in the folder.", self).exec()
+                return
+
+            # Parse hourly sales CSVs
+            self.log("\nParsing hourly sales CSVs...")
+            hourly_transactions = []
+            for csv_file in hourly_files:
+                file_path = os.path.join(folder, csv_file)
+                transactions = self.parse_hourly_csv(file_path)
+                hourly_transactions.extend(transactions)
+                self.log(f"  {csv_file}: {len(transactions)} transaction(s)")
+
+            self.log(f"\nTotal transactions from hourly CSVs: {len(hourly_transactions)}")
+
+            # Parse EOD CSV
+            eod_data = {}
+            if eod_file:
+                self.log("\nParsing EOD CSV...")
+                eod_path = os.path.join(folder, eod_file)
+                eod_data = self.parse_eod_csv(eod_path)
+                self.log(f"  EOD data loaded: {len(eod_data)} fields")
+
+            # Generate Excel output
+            self.log("\nGenerating Excel report...")
+            output_filename = self.output_name.text().strip()
+            if not output_filename.endswith('.xlsx'):
+                output_filename += '.xlsx'
+
+            output_path = os.path.join(folder, output_filename)
+            self.generate_excel(hourly_transactions, eod_data, output_path)
+
+            self.log(f"\n✅ Report generated successfully!")
+            self.log(f"Output: {output_path}")
+
+            AppDialog("Success", f"Report generated:\n{output_path}", self).exec()
+
+        except Exception as e:
+            logger.exception("Ayala Checker error")
+            self.log(f"\n❌ Error: {str(e)}")
+            AppDialog("Error", f"Failed to generate report:\n{str(e)}", self).exec()
+        finally:
+            self.generate_btn.setEnabled(True)
+            self.generate_btn.setText("Generate Report")
+
+    def parse_hourly_csv(self, file_path):
+        """Parse an hourly sales CSV file and return list of transactions."""
+        transactions = []
+        current_transaction = None
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                parts = line.split(',', 1)
+                if len(parts) != 2:
+                    continue
+
+                key, value = parts
+
+                # Header fields (only for first transaction in file)
+                if key in ['CCCODE', 'MERCHANT_NAME', 'TRN_DATE', 'NO_TRN']:
+                    if current_transaction is None:
+                        if not transactions:
+                            transactions.append({'_header': {}})
+                        transactions[0]['_header'][key] = value
+                    continue
+
+                # Transaction start marker
+                if key == 'CDATE' and current_transaction is None:
+                    current_transaction = {'CDATE': value, 'items': []}
+                    continue
+
+                if current_transaction is not None:
+                    # Item fields
+                    if key in ['QTY', 'ITEMCODE', 'PRICE', 'LDISC']:
+                        if key == 'QTY' and current_transaction.get('items') and 'QTY' in current_transaction['items'][-1]:
+                            # Start new item
+                            current_transaction['items'].append({key: value})
+                        elif current_transaction['items']:
+                            current_transaction['items'][-1][key] = value
+                        else:
+                            current_transaction['items'].append({key: value})
+                        continue
+
+                    # Check if this is a new transaction (CDATE appears again)
+                    if key == 'CDATE' and 'CDATE' in current_transaction:
+                        transactions.append(current_transaction)
+                        current_transaction = {'CDATE': value, 'items': []}
+                        continue
+
+                    # Regular transaction field
+                    current_transaction[key] = value
+
+            # Don't forget the last transaction
+            if current_transaction:
+                transactions.append(current_transaction)
+
+        return transactions
+
+    def parse_eod_csv(self, file_path):
+        """Parse an EOD CSV file and return dictionary of fields."""
+        eod_data = {}
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(',', 1)
+                if len(parts) == 2:
+                    eod_data[parts[0]] = parts[1]
+        return eod_data
+
+    def generate_excel(self, hourly_transactions, eod_data, output_path):
+        """Generate Excel file matching the Sample Output format."""
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Ayala Report"
+
+        # Define styles
+        header_font = Font(bold=True, size=11, name='Calibri')
+        header_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+        normal_font = Font(size=11, name='Calibri')
+        total_font = Font(bold=True, size=11, color="0000FF", name='Calibri')
+        total_fill = PatternFill(start_color="E6F3FF", end_color="E6F3FF", fill_type="solid")
+        eod_font = Font(bold=True, size=11, color="006600", name='Calibri')
+        eod_fill = PatternFill(start_color="E6FFE6", end_color="E6FFE6", fill_type="solid")
+
+        # Get header from first transaction
+        header = hourly_transactions[0].get('_header', {}) if hourly_transactions else {}
+
+        # Row 1-4: Header fields
+        header_fields = ['CCCODE', 'MERCHANT_NAME', 'TRN_DATE', 'NO_TRN']
+        for row_idx, field in enumerate(header_fields, start=1):
+            ws.cell(row=row_idx, column=1, value=field)
+            ws.cell(row=row_idx, column=2, value=header.get(field, ''))
+            ws.cell(row=row_idx, column=1).font = normal_font
+
+        # Starting row for transactions
+        start_row = 5
+
+        # Define transaction fields to display
+        transaction_fields = [
+            'CDATE', 'TRN_TIME', 'TER_NO', 'TRANSACTION_NO',
+            'GROSS_SLS', 'VAT_AMNT', 'VATABLE_SLS', 'NONVAT_SLS',
+            'VATEXEMPT_SLS', 'VATEXEMPT_AMNT', 'LOCAL_TAX',
+            'PWD_DISC', 'SNRCIT_DISC', 'EMPLO_DISC', 'AYALA_DISC',
+            'STORE_DISC', 'OTHER_DISC', 'REFUND_AMT', 'SCHRGE_AMT', 'OTHER_SCHR',
+            'CASH_SLS', 'CARD_SLS', 'EPAY_SLS', 'DCARD_SLS', 'OTHERSL_SLS',
+            'CHECK_SLS', 'GC_SLS', 'MASTERCARD_SLS', 'VISA_SLS', 'AMEX_SLS',
+            'DINERS_SLS', 'JCB_SLS', 'GCASH_SLS', 'PAYMAYA_SLS', 'ALIPAY_SLS',
+            'WECHAT_SLS', 'GRAB_SLS', 'FOODPANDA_SLS', 'MASTERDEBIT_SLS',
+            'VISADEBIT_SLS', 'PAYPAL_SLS', 'ONLINE_SLS',
+            'OPEN_SALES', 'OPEN_SALES_2', 'OPEN_SALES_3', 'OPEN_SALES_4',
+            'OPEN_SALES_5', 'OPEN_SALES_6', 'OPEN_SALES_7', 'OPEN_SALES_8',
+            'OPEN_SALES_9', 'OPEN_SALES_10', 'OPEN_SALES_11', 'GC_EXCESS',
+            'MOBILE_NO', 'NO_CUST', 'TRN_TYPE', 'SLS_FLAG', 'VAT_PCT', 'QTY_SLD'
+        ]
+
+        # Define numeric fields that should be converted to numbers
+        numeric_fields = [
+            'GROSS_SLS', 'VAT_AMNT', 'VATABLE_SLS', 'NONVAT_SLS',
+            'VATEXEMPT_SLS', 'VATEXEMPT_AMNT', 'LOCAL_TAX',
+            'PWD_DISC', 'SNRCIT_DISC', 'EMPLO_DISC', 'AYALA_DISC',
+            'STORE_DISC', 'OTHER_DISC', 'REFUND_AMT', 'SCHRGE_AMT', 'OTHER_SCHR',
+            'CASH_SLS', 'CARD_SLS', 'EPAY_SLS', 'DCARD_SLS', 'OTHERSL_SLS',
+            'CHECK_SLS', 'GC_SLS', 'MASTERCARD_SLS', 'VISA_SLS', 'AMEX_SLS',
+            'DINERS_SLS', 'JCB_SLS', 'GCASH_SLS', 'PAYMAYA_SLS', 'ALIPAY_SLS',
+            'WECHAT_SLS', 'GRAB_SLS', 'FOODPANDA_SLS', 'MASTERDEBIT_SLS',
+            'VISADEBIT_SLS', 'PAYPAL_SLS', 'ONLINE_SLS',
+            'OPEN_SALES', 'OPEN_SALES_2', 'OPEN_SALES_3', 'OPEN_SALES_4',
+            'OPEN_SALES_5', 'OPEN_SALES_6', 'OPEN_SALES_7', 'OPEN_SALES_8',
+            'OPEN_SALES_9', 'OPEN_SALES_10', 'OPEN_SALES_11', 'GC_EXCESS',
+            'NO_CUST', 'QTY_SLD', 'VAT_PCT', 'PRICE', 'LDISC', 'QTY'
+        ]
+
+        def convert_value(field, value):
+            """Convert value to number if field is numeric, otherwise keep as string."""
+            if field in numeric_fields and value:
+                try:
+                    if '.' in str(value):
+                        return float(value)
+                    else:
+                        return int(value)
+                except (ValueError, TypeError):
+                    return value
+            return value
+
+        # Find max items per transaction
+        max_items = max(len(t.get('items', [])) for t in hourly_transactions) if hourly_transactions else 0
+
+        # Write transactions side by side
+        num_transactions = len(hourly_transactions)
+        for trn_idx, transaction in enumerate(hourly_transactions):
+            col_start = 1 + (trn_idx * 2)  # Each transaction takes 2 columns
+
+            # Write transaction fields
+            for row_offset, field in enumerate(transaction_fields):
+                row = start_row + row_offset
+                ws.cell(row=row, column=col_start, value=field)
+                value = transaction.get(field, '')
+                ws.cell(row=row, column=col_start + 1, value=convert_value(field, value))
+                ws.cell(row=row, column=col_start).font = normal_font
+
+            # Write items
+            item_start_row = start_row + len(transaction_fields)
+            for item_idx in range(max_items):
+                row = item_start_row + (item_idx * 4)  # 4 rows per item (QTY, ITEMCODE, PRICE, LDISC)
+                if item_idx < len(transaction.get('items', [])):
+                    item = transaction['items'][item_idx]
+                    ws.cell(row=row, column=col_start, value='QTY')
+                    ws.cell(row=row, column=col_start).font = normal_font
+                    ws.cell(row=row, column=col_start + 1, value=convert_value('QTY', item.get('QTY', '')))
+                    ws.cell(row=row + 1, column=col_start, value='ITEMCODE')
+                    ws.cell(row=row + 1, column=col_start).font = normal_font
+                    ws.cell(row=row + 1, column=col_start + 1, value=item.get('ITEMCODE', ''))
+                    ws.cell(row=row + 2, column=col_start, value='PRICE')
+                    ws.cell(row=row + 2, column=col_start).font = normal_font
+                    ws.cell(row=row + 2, column=col_start + 1, value=convert_value('PRICE', item.get('PRICE', '')))
+                    ws.cell(row=row + 3, column=col_start, value='LDISC')
+                    ws.cell(row=row + 3, column=col_start).font = normal_font
+                    ws.cell(row=row + 3, column=col_start + 1, value=convert_value('LDISC', item.get('LDISC', '')))
+
+        # Add SUM column for hourly totals
+        sum_col = 1 + (num_transactions * 2)
+        ws.cell(row=4, column=sum_col, value="HOURLY TOTAL")
+        ws.cell(row=4, column=sum_col).font = total_font
+        ws.cell(row=4, column=sum_col).fill = total_fill
+
+        # Fields that should have SUM formulas
+        sum_fields = [
+            'GROSS_SLS', 'VAT_AMNT', 'VATABLE_SLS', 'NONVAT_SLS',
+            'VATEXEMPT_SLS', 'VATEXEMPT_AMNT', 'LOCAL_TAX',
+            'PWD_DISC', 'SNRCIT_DISC', 'EMPLO_DISC', 'AYALA_DISC',
+            'STORE_DISC', 'OTHER_DISC', 'REFUND_AMT', 'SCHRGE_AMT', 'OTHER_SCHR',
+            'CASH_SLS', 'CARD_SLS', 'EPAY_SLS', 'DCARD_SLS', 'OTHERSL_SLS',
+            'CHECK_SLS', 'GC_SLS', 'MASTERCARD_SLS', 'VISA_SLS', 'AMEX_SLS',
+            'DINERS_SLS', 'JCB_SLS', 'GCASH_SLS', 'PAYMAYA_SLS', 'ALIPAY_SLS',
+            'WECHAT_SLS', 'GRAB_SLS', 'FOODPANDA_SLS', 'MASTERDEBIT_SLS',
+            'VISADEBIT_SLS', 'PAYPAL_SLS', 'ONLINE_SLS',
+            'OPEN_SALES', 'OPEN_SALES_2', 'OPEN_SALES_3', 'OPEN_SALES_4',
+            'OPEN_SALES_5', 'OPEN_SALES_6', 'OPEN_SALES_7', 'OPEN_SALES_8',
+            'OPEN_SALES_9', 'OPEN_SALES_10', 'OPEN_SALES_11', 'GC_EXCESS',
+            'NO_CUST', 'QTY_SLD'
+        ]
+
+        # Add SUM formulas for each transaction field
+        for row_offset, field in enumerate(transaction_fields):
+            row = start_row + row_offset
+            ws.cell(row=row, column=sum_col, value=field)
+            ws.cell(row=row, column=sum_col).font = normal_font
+
+            if field in sum_fields:
+                # Build SUM formula using range format
+                first_col = get_column_letter(2)  # Column B
+                last_col = get_column_letter(1 + (num_transactions * 2) - 1)  # Last transaction value column
+                formula = f"=SUM({first_col}{row}:{last_col}{row})"
+                ws.cell(row=row, column=sum_col + 1, value=formula)
+                ws.cell(row=row, column=sum_col + 1).font = total_font
+
+        # Add separator column (black)
+        separator_col = sum_col + 2
+        separator_fill = PatternFill(start_color="000000", end_color="000000", fill_type="solid")
+        separator_letter = get_column_letter(separator_col)
+        ws.column_dimensions[separator_letter].width = 3.2
+
+        # Add EOD data on the right side
+        if eod_data:
+            eod_col = sum_col + 3  # After separator column
+
+            # EOD header starts 3 rows above the transaction data
+            eod_header_row = start_row - 3  # Row 2 instead of row 5
+            ws.cell(row=eod_header_row, column=eod_col, value="EOD VALUE")
+            ws.cell(row=eod_header_row, column=eod_col).font = eod_font
+            ws.cell(row=eod_header_row, column=eod_col).fill = eod_fill
+
+            # Write ALL EOD fields starting from eod_header_row + 1
+            eod_row = eod_header_row + 1
+            for eod_field, eod_value in eod_data.items():
+                ws.cell(row=eod_row, column=eod_col, value=eod_field)
+                ws.cell(row=eod_row, column=eod_col).font = normal_font
+                ws.cell(row=eod_row, column=eod_col + 1, value=convert_value(eod_field, eod_value))
+                eod_row += 1
+
+        # Auto-fit column widths (except separator)
+        for col in ws.columns:
+            max_length = 0
+            column_letter = col[0].column_letter
+            # Skip separator column
+            if column_letter == separator_letter:
+                continue
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 30)
+            ws.column_dimensions[column_letter].width = adjusted_width
+
+        wb.save(output_path)
+        logger.info("Ayala Checker: Excel report saved to %s", output_path)
+
+    def compare_totals(self, hourly_transactions, eod_data):
+        """Compare hourly totals against EOD values."""
+        # Calculate totals from hourly transactions
+        numeric_fields = [
+            'GROSS_SLS', 'VAT_AMNT', 'VATABLE_SLS', 'NONVAT_SLS',
+            'VATEXEMPT_SLS', 'VATEXEMPT_AMNT', 'LOCAL_TAX',
+            'PWD_DISC', 'SNRCIT_DISC', 'EMPLO_DISC', 'AYALA_DISC',
+            'STORE_DISC', 'OTHER_DISC', 'REFUND_AMT', 'SCHRGE_AMT', 'OTHER_SCHR',
+            'CASH_SLS', 'CARD_SLS', 'EPAY_SLS', 'DCARD_SLS', 'OTHERSL_SLS',
+            'CHECK_SLS', 'GC_SLS', 'MASTERCARD_SLS', 'VISA_SLS', 'AMEX_SLS',
+            'DINERS_SLS', 'JCB_SLS', 'GCASH_SLS', 'PAYMAYA_SLS', 'ALIPAY_SLS',
+            'WECHAT_SLS', 'GRAB_SLS', 'FOODPANDA_SLS', 'MASTERDEBIT_SLS',
+            'VISADEBIT_SLS', 'PAYPAL_SLS', 'ONLINE_SLS',
+            'OPEN_SALES', 'OPEN_SALES_2', 'OPEN_SALES_3', 'OPEN_SALES_4',
+            'OPEN_SALES_5', 'OPEN_SALES_6', 'OPEN_SALES_7', 'OPEN_SALES_8',
+            'OPEN_SALES_9', 'OPEN_SALES_10', 'OPEN_SALES_11', 'GC_EXCESS',
+            'NO_CUST', 'QTY_SLD'
+        ]
+
+        hourly_totals = {}
+        for field in numeric_fields:
+            hourly_totals[field] = 0
+
+        for transaction in hourly_transactions:
+            for field in numeric_fields:
+                try:
+                    hourly_totals[field] += float(transaction.get(field, 0))
+                except (ValueError, TypeError):
+                    pass
+
+        # EOD field mapping (some fields have different names)
+        eod_field_mapping = {
+            'OTHERSL_SLS': 'OTHER_SLS',  # EOD uses OTHER_SLS
+        }
+
+        # Compare with EOD
+        self.log("\n--- Comparison Results ---")
+        match_count = 0
+        mismatch_count = 0
+
+        for field, hourly_val in hourly_totals.items():
+            # Skip fields that are always 0 or text
+            if hourly_val == 0 and field not in ['NO_CUST']:
+                continue
+
+            # Get corresponding EOD field
+            eod_field = eod_field_mapping.get(field, field)
+            eod_val_str = eod_data.get(eod_field, '0')
+            try:
+                eod_val = float(eod_val_str)
+            except ValueError:
+                eod_val = 0
+
+            diff = abs(hourly_val - eod_val)
+            if diff < 1:  # Match if difference is less than 1
+                status = "✅ MATCH"
+                match_count += 1
+            else:
+                status = f"❌ MISMATCH (diff: {diff:.2f})"
+                mismatch_count += 1
+
+            self.log(f"{field}: Hourly={hourly_val:.2f}, EOD={eod_val:.2f} {status}")
+
+        self.log(f"\nSummary: {match_count} matched, {mismatch_count} mismatched")
 
 
 # ================= MAIN WINDOW =================
@@ -2852,8 +3511,9 @@ class LoginWindow(QtWidgets.QWidget):
         dialog.exec()
 
     def run_tool_2(self):
-        """Tool 2 — TODO: implement"""
-        AppDialog("Tool 2", "Tool 2 is not yet implemented.", self).exec()
+        """Ayala Checker - Compare hourly sales vs EOD"""
+        dialog = AyalaCheckerDialog(self)
+        dialog.exec()
 
     def run_tool_3(self):
         """Tool 3 — TODO: implement"""
@@ -3818,6 +4478,34 @@ class LoginWindow(QtWidgets.QWidget):
 
  
  #detect windows theme
+def _cleanup_update_artifacts():
+    """
+    Remove files left behind by a previous update attempt:
+      * _update_swap.bat - it already ran, so it must not run again
+      * *.new            - staged files that never got swapped in
+    Called once at startup, after the working directory is set.
+    """
+    if getattr(sys, 'frozen', False):
+        app_dir = os.path.dirname(sys.executable)
+    else:
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+
+    try:
+        entries = os.listdir(app_dir)
+    except OSError:
+        return
+
+    for name in entries:
+        if name == "_update_swap.bat" or name.endswith(".new"):
+            path = os.path.join(app_dir, name)
+            try:
+                os.remove(path)
+                logger.info("Cleaned up leftover update file: %s", name)
+            except OSError:
+                logger.warning("Could not remove leftover update file: %s", name)
+
+
+
 def is_windows_dark_mode():
     try:
         registry = winreg.ConnectRegistry(None, winreg.HKEY_CURRENT_USER)
@@ -3871,6 +4559,8 @@ if __name__ == "__main__":
     # current working directory (matters when launching via shortcut).
     if getattr(sys, 'frozen', False):
         os.chdir(os.path.dirname(sys.executable))
+
+    _cleanup_update_artifacts()
 
     logger.info("=== Application starting (cwd=%s) ===", os.getcwd())
     logger.info("Python %s, frozen=%s", sys.version, getattr(sys, 'frozen', False))
