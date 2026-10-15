@@ -1,6 +1,7 @@
 import sys
 import os
 import winreg
+import ctypes
 import logging
 from datetime import datetime
 from io import BytesIO
@@ -411,6 +412,14 @@ def _apply_zip_update(zip_path):
         return False
 
 
+def _bat_quote(path):
+    """
+    Quote a path for the generated swap script. Doubling any percent sign
+    stops cmd.exe from reading it as an environment variable reference.
+    """
+    return '"%s"' % str(path).replace("%", "%%")
+
+
 def _write_swap_script(bat_path, app_dir, exe_name, locked_files):
     """
     Write the batch script that replaces locked files after the app exits.
@@ -420,9 +429,25 @@ def _write_swap_script(bat_path, app_dir, exe_name, locked_files):
       * Delays use `ping`, because `timeout` errors out with no console.
       * One `:replace` subroutine is `call`ed per file - batch labels must
         be unique, so a retry loop cannot be inlined more than once.
+      * The app is relaunched with `start /d`, so it opens in its own folder
+        even when the shortcut's "Start in" points somewhere else.
+      * Arguments are quoted through _bat_quote(), which doubles percent
+        signs so a literal "%" in the install path is not read as a variable.
+      * Windows tools are called by full path: Git for Windows ships a Unix
+        `find`, which shadows find.exe and would make the wait loop give up
+        before the running app has released its files.
     """
     pid = os.getpid()
     target = os.path.join(app_dir, exe_name or "report.py")
+
+    # Full paths for every Windows tool: a Unix `find` earlier in PATH (Git for
+    # Windows ships one) would fail, and the wait loop would stop waiting for
+    # the running app to exit.
+    sys32 = os.path.join("%SystemRoot%", "System32")
+    tasklist = os.path.join(sys32, "tasklist.exe")
+    find = os.path.join(sys32, "find.exe")
+    taskkill = os.path.join(sys32, "taskkill.exe")
+    ping = os.path.join(sys32, "ping.exe")
 
     lines = [
         "@echo off",
@@ -432,24 +457,24 @@ def _write_swap_script(bat_path, app_dir, exe_name, locked_files):
         "rem --- wait up to ~40s for the running app to exit ---",
         "set _tries=0",
         ":waitloop",
-        'tasklist /nh /fi "PID eq %PID%" 2>nul | find /i "%PID%" >nul',
+        '"%s" /nh /fi "PID eq %%PID%%" 2>nul | "%s" /i "%%PID%%" >nul' % (tasklist, find),
         "if errorlevel 1 goto swap",
         "set /a _tries=%_tries%+1",
         "if %_tries% geq 20 goto forcekill",
-        "ping -n 2 127.0.0.1 >nul",
+        '"%s" -n 2 127.0.0.1 >nul' % ping,
         "goto waitloop",
         ":forcekill",
-        "taskkill /f /pid %PID% >nul 2>&1",
+        '"%s" /f /pid %%PID%% >nul 2>&1' % taskkill,
         "",
         ":swap",
         "rem --- give the OS a moment to release file handles ---",
-        "ping -n 3 127.0.0.1 >nul",
+        '"%s" -n 3 127.0.0.1 >nul' % ping,
     ]
     for staged, dst in locked_files:
-        lines.append('call :replace "%s" "%s"' % (staged, dst))
+        lines.append('call :replace %s %s' % (_bat_quote(staged), _bat_quote(dst)))
     lines += [
         "",
-        'start "" "%s"' % target,
+        'start "" /d %s %s' % (_bat_quote(app_dir), _bat_quote(target)),
         "exit /b 0",
         "",
         "rem --- replace one file, retrying while it stays locked ---",
@@ -460,7 +485,7 @@ def _write_swap_script(bat_path, app_dir, exe_name, locked_files):
         'if not exist "%~1" exit /b 0',
         "set /a _rtries=%_rtries%+1",
         "if %_rtries% geq 20 exit /b 1",
-        "ping -n 2 127.0.0.1 >nul",
+        '"%s" -n 2 127.0.0.1 >nul' % ping,
         "goto replace_loop",
     ]
 
@@ -884,12 +909,24 @@ class UpdateDialog(QtWidgets.QDialog):
 
         if getattr(sys, 'frozen', False):
             app_dir = os.path.dirname(sys.executable)
+            exe_name = os.path.basename(sys.executable)
         else:
             app_dir = os.path.dirname(os.path.abspath(__file__))
+            exe_name = None
 
         bat_path = os.path.join(app_dir, "_update_swap.bat")
 
-        # If a swap script exists (locked files), just quit — the bat handles restart
+        # Nothing was locked in this update, so no swap script exists yet. Write
+        # a relaunch-only one anyway: starting the new copy while this process
+        # still holds the single-instance mutex would make it refuse to start
+        # and leave the user with no window at all.
+        if not os.path.isfile(bat_path) and exe_name:
+            try:
+                _write_swap_script(bat_path, app_dir, exe_name, [])
+            except Exception:
+                logger.exception("Could not write the relaunch script")
+
+        # The bat waits for this process to exit, then starts the new copy
         if os.path.isfile(bat_path):
             logger.info("Swap script found, launching: %s", bat_path)
             subprocess.Popen(["cmd", "/c", bat_path], shell=False, cwd=app_dir,
@@ -4477,7 +4514,76 @@ class LoginWindow(QtWidgets.QWidget):
 
 
  
- #detect windows theme
+# ================= SINGLE INSTANCE =================
+# No global namespace prefix: the mutex stays inside one Windows session, so
+# two RDP sessions can each keep one copy running.
+APP_MUTEX_NAME = "AutoReport-Report-Marilag-SingleInstance"
+MAIN_WINDOW_TITLE = "Report — Marilag"
+
+# Kept alive for the lifetime of the process so the mutex is only released
+# when the app exits.
+_mutex_handle = None
+
+
+def _acquire_single_instance_lock():
+    """
+    Hold a named Windows mutex so only one copy of the app runs at a time.
+    Returns True for the first instance and False when another one already
+    holds the mutex. Windows releases the mutex when the process exits, even
+    if the app crashes, so a stale lock can never block a fresh start.
+    """
+    global _mutex_handle
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p
+        ]
+        handle = kernel32.CreateMutexW(None, False, APP_MUTEX_NAME)
+        err = ctypes.get_last_error()
+
+        if not handle:
+            logger.warning("Could not create the single-instance mutex (error %d) — continuing", err)
+            return True
+
+        ERROR_ALREADY_EXISTS = 183
+        if err == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            logger.info("Another instance already holds mutex %s — exiting", APP_MUTEX_NAME)
+            return False
+
+        _mutex_handle = handle
+        logger.info("Single-instance mutex acquired: %s", APP_MUTEX_NAME)
+        return True
+    except Exception:
+        logger.exception("Single-instance check failed — continuing")
+        return True
+
+
+def _focus_running_instance():
+    """
+    Best-effort: raise the window of the instance that is already running, so
+    the user lands on the app instead of only seeing the message box.
+    """
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.FindWindowW.restype = ctypes.c_void_p
+        user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        hwnd = user32.FindWindowW(None, MAIN_WINDOW_TITLE)
+        if not hwnd:
+            logger.debug("Window %r not found — nothing to focus", MAIN_WINDOW_TITLE)
+            return False
+        SW_RESTORE = 9
+        user32.ShowWindow(ctypes.c_void_p(hwnd), SW_RESTORE)
+        user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
+        logger.info("Raised the window of the running instance")
+        return True
+    except Exception:
+        logger.exception("Could not focus the running instance")
+        return False
+
+
+# detect windows theme
 def _cleanup_update_artifacts():
     """
     Remove files left behind by a previous update attempt:
@@ -4560,12 +4666,20 @@ if __name__ == "__main__":
     if getattr(sys, 'frozen', False):
         os.chdir(os.path.dirname(sys.executable))
 
+    app = QApplication(sys.argv)
+
+    # Only one copy of the app may run at a time. Checked before any cleanup,
+    # so a second launch cannot delete a pending update payload.
+    if not _acquire_single_instance_lock():
+        _focus_running_instance()
+        AppDialog("Already Running", "Application is already running.").exec()
+        sys.exit(0)
+
     _cleanup_update_artifacts()
 
     logger.info("=== Application starting (cwd=%s) ===", os.getcwd())
     logger.info("Python %s, frozen=%s", sys.version, getattr(sys, 'frozen', False))
 
-    app = QApplication(sys.argv)
     app.setWindowIcon(QtGui.QIcon("asset/death.ico"))
 
     # Show splash screen first
