@@ -7,9 +7,12 @@ import shutil
 import tempfile
 import winreg
 import ctypes
+import ctypes.wintypes
 import logging
 from datetime import datetime
 from io import BytesIO
+from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
 
 import requests
 from requests.auth import HTTPBasicAuth
@@ -18,9 +21,9 @@ from PIL import Image
 from docx import Document
 from docx.shared import Inches
 
-from PyQt6 import QtWidgets, QtCore, QtGui
+from PyQt6 import QtWidgets, QtCore, QtGui, sip
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl
-from PyQt6.QtGui import QIcon, QDesktopServices
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QApplication,
     QDialog, QFormLayout, QLineEdit, QComboBox,
@@ -28,30 +31,71 @@ from PyQt6.QtWidgets import (
     QTextEdit, QFileDialog
 )
 
-import pytz
-import pyrebase
-import firebase_admin
-from firebase_admin import credentials, firestore
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
 
+# ================= APP PATHS =================
+# Everything the app reads or writes is anchored to its own directory, never
+# to the current working directory. A shortcut whose "Start in" differs from
+# the install folder - or a source run launched from elsewhere - used to make
+# the template "disappear" and scatter report folders wherever the process
+# happened to start.
+
+def _app_dir():
+    """Directory the app runs from, whether frozen or run from source."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_DIR = _app_dir()
+LOG_PATH = os.path.join(APP_DIR, "report_log.txt")
+TEMPLATE_PATH = os.path.join(APP_DIR, "Report Template.docx")
+POT_TEMPLATE_PATH = os.path.join(APP_DIR, "POT_Template.docx")
+REPORTS_DIR = os.path.join(APP_DIR, "Reports")
+ASSET_DIR = os.path.join(APP_DIR, "asset")
+
+
+def _safe_filename(name):
+    """Strip characters Windows will not accept in a file name.
+
+    The client name and ticket title come straight from user input; a stray
+    "/" or ":" made doc.save() fail with a bare PermissionError.
+    """
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name or ""))
+    return cleaned.strip(" .") or "Untitled"
+
 # ================= LOGGING SETUP =================
-LOG_FILENAME = "report_log.txt"
+# INFO by default, and capped: the old DEBUG + plain FileHandler combination
+# wrote full tracebacks, e-mail addresses and ticket titles to a file that grew
+# without limit next to the exe.
+_log_handlers = []
+try:
+    _log_handlers.append(RotatingFileHandler(
+        LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3,
+        encoding="utf-8", delay=True,
+    ))
+except OSError:
+    pass  # read-only install folder: the file log is best effort
+
+# A windowed PyInstaller build has sys.stdout/sys.stderr set to None, so a
+# console handler would raise on the first log record.
+if getattr(sys, "stderr", None) is not None:
+    _log_handlers.append(logging.StreamHandler(sys.stderr))
+
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILENAME, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=_log_handlers,
 )
 logger = logging.getLogger("report")
 
 org_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection/WebPOS"
 collection_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection"
-template_path = "Report Template.docx"
+_TFS_HOST = collection_url.split("/tfs/")[0]
+template_path = TEMPLATE_PATH
 
 # ================= HTTP TIME-OUTS =================
 # requests has no default timeout, so without these a stalled connection
@@ -68,7 +112,7 @@ UPDATE_OK_FILE = "_update_ok.flag"       # written once a window is up
 UPDATE_FAILED_FILE = "_update_failed.txt"  # written by the swap script
 
 # ================= AUTO-UPDATE CONFIG =================
-APP_VERSION = "3.0.8.5"
+APP_VERSION = "3.0.9"
 GITHUB_REPO = "shinispades/AutoReport"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -85,6 +129,9 @@ GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 #   }
 # Then implement the handler method on LoginWindow.
 # The Tools page auto-fetches all tools from this list.
+#
+# Tools listed here are still placeholders: the page marks them "coming soon"
+# and they do nothing when clicked. Empty them out as each tool is built.
 
 TOOL_REGISTRY = [
     # --- Tool 1 ---
@@ -179,6 +226,7 @@ TOOL_REGISTRY = [
     },
     # === ADD MORE TOOLS BELOW ===
     # {
+    #     "available": True,
     #     "id": "my_new_tool",
     #     "name": "My New Tool",
     #     "description": "What it does",
@@ -189,40 +237,44 @@ TOOL_REGISTRY = [
 ]
 
 
+UNFINISHED_TOOL_IDS = {f"tool_{n}" for n in range(3, 11)}
+
+
 def _fetch_pat_expiry(pat):
     """
     Query the TFS token API to get the expiry date of the given PAT.
     Returns an ISO date string (e.g. '2025-08-01T00:00:00Z') or None.
+
+    Only the token that is actually in use is reported. The old fallback to
+    `pats[0]` handed back some other PAT's expiry date, which then appeared in
+    Settings as if it belonged to the signed-in user - worse than no date.
     """
+    if not pat:
+        return None
+
     url = f"{collection_url}/_apis/tokens/pats?api-version=7.1-preview.1"
     logger.info("Fetching PAT expiry from %s", url)
     try:
-        resp = requests.get(url, auth=HTTPBasicAuth("", pat), timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            pats = data.get("patTokens", data.get("value", []))
-            logger.debug("Token API returned %d PAT(s)", len(pats))
-            # Find the PAT that matches the token we're using (compare first 4 chars)
-            short = pat[:4]
-            for token in pats:
-                display_token = token.get("displayTokenId", "")
-                if display_token.startswith(short):
-                    expiry = token.get("validTo", "")
-                    logger.info("PAT expiry found: %s", expiry)
-                    return expiry
-            # If no match by prefix, return the first token's expiry
-            if pats:
-                expiry = pats[0].get("validTo", "")
-                logger.info("PAT expiry (first token): %s", expiry)
-                return expiry
-            logger.warning("No PAT tokens returned from API")
-            return None
-        elif resp.status_code == 403:
+        resp = requests.get(url, auth=HTTPBasicAuth("", pat), timeout=HTTP_TIMEOUT)
+        if resp.status_code == 403:
             logger.warning("PAT lacks 'vso.tokens_manage' scope — cannot read expiry (403)")
             return None
-        else:
+        if resp.status_code != 200:
             logger.warning("Token API returned status %d: %s", resp.status_code, resp.text[:200])
             return None
+
+        data = resp.json()
+        pats = data.get("patTokens", data.get("value", []))
+        logger.debug("Token API returned %d PAT(s)", len(pats))
+        short = pat[:4]
+        for token in pats:
+            if (token.get("displayTokenId") or "").startswith(short):
+                expiry = token.get("validTo", "")
+                logger.info("PAT expiry found: %s", expiry)
+                return expiry or None
+
+        logger.warning("None of the %d PAT(s) matched the token in use - expiry unknown", len(pats))
+        return None
     except Exception:
         logger.exception("Failed to fetch PAT expiry")
         return None
@@ -258,7 +310,16 @@ def _check_for_update():
             match = re.match(r"(\d+(?:\.\d+)*)", (v or "").strip())
             return [int(p) for p in match.group(1).split(".")] if match else [0]
 
-        if parse_ver(tag) <= parse_ver(APP_VERSION):
+        def ver_key(v):
+            """Zero-padded so 3.1 and 3.1.0 are the same version. Compared
+            as plain lists, [3, 1, 0] > [3, 1] and the app offered an
+            "update" to the build it was already running."""
+            parts = parse_ver(v)
+            while len(parts) < 4:
+                parts.append(0)
+            return parts
+
+        if ver_key(tag) <= ver_key(APP_VERSION):
             logger.info("Already up-to-date")
             return None
 
@@ -312,8 +373,12 @@ def _download_update(download_url, progress_callback=None,
     """
     import hashlib
 
-    filename = download_url.split("/")[-1].split("?")[0] or "update.zip"
-    tmp_path = os.path.join(tempfile.gettempdir(), filename)
+    filename = os.path.basename(download_url.split("?")[0]) or "update.zip"
+    # One private directory per download. The shared %TEMP% let a second
+    # session - or another user on the same machine - collide with, or
+    # pre-place, the file this process is about to execute.
+    download_dir = tempfile.mkdtemp(prefix="autoreport_update_")
+    tmp_path = os.path.join(download_dir, filename)
     part_path = tmp_path + ".part"
 
     for attempt in range(1, attempts + 1):
@@ -364,13 +429,6 @@ def _download_update(download_url, progress_callback=None,
             time.sleep(2 * attempt)
 
     return None
-
-
-def _app_dir():
-    """Directory the app runs from, whether frozen or run from source."""
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
 
 
 def _clear_update_markers(app_dir):
@@ -768,6 +826,13 @@ def _write_swap_script(bat_path, app_dir, exe_name, locked_files):
     lines = [
         "@echo off",
         "rem AutoReport update swap script",
+        # cmd.exe decodes the file with the *current* code page, so UTF-8 is
+        # only safe with this as the first command. The script used to be
+        # written with the ANSI code page, which mangles any install path
+        # containing non-ASCII characters (C:\\Users\\Maria with an accent,
+        # or a name in another script) - the swap then silently targeted a
+        # path that does not exist.
+        "chcp 65001 >nul",
         'set "PID=%s"' % pid,
         "",
         "rem --- wait up to ~40s for the running app to exit ---",
@@ -814,13 +879,33 @@ def _write_swap_script(bat_path, app_dir, exe_name, locked_files):
     ]
 
     data = "\r\n".join(lines) + "\r\n"
-    with open(bat_path, "w", encoding="mbcs", newline="") as f:
+    # UTF-8 on purpose: the chcp 65001 above makes cmd read it that way.
+    # "mbcs" is deprecated in 3.11+ and cannot represent every install path.
+    with open(bat_path, "w", encoding="utf-8", newline="") as f:
         f.write(data)
     logger.info("Wrote swap script (%d file(s) to replace): %s",
                 len(locked_files), bat_path)
 
 
-# Firebase — lazy initialized on first use so the UI appears instantly
+# ================= FIREBASE =================
+# Sign-in uses the public web config below: that apiKey is meant to be shipped
+# and is safe in a client. Data access no longer uses the Admin SDK.
+#
+# Shipping serviceAccountKey.json inside the release handed every person who
+# downloaded the app full read/write access to the whole Firestore project.
+# Profiles are now read and written as the signed-in user, with that user's ID
+# token, so Firestore security rules decide what is reachable. Requirements:
+#
+#   match /users/{uid} {
+#     allow read, write: if request.auth != null && request.auth.uid == uid;
+#   }
+#
+# TFS PATs are no longer stored in Firestore at all - see _save_pat_local().
+#
+# Auth is two plain HTTP endpoints (Identity Toolkit + Secure Token), so the
+# unmaintained pyrebase package - and the gcloud/oauth2client/pycryptodome
+# chain it drags in - is no longer a dependency at all.
+
 _firebase_config = {
   "apiKey": "AIzaSyD-uAl1Ce-2NRoAVVYExH5-MSJ6K4y-LEo",
   "authDomain": "autoreport-db4a7.firebaseapp.com",
@@ -831,25 +916,305 @@ _firebase_config = {
   "appId": "1:173593376987:web:66412a51ebb20818a9b4fe",
   "measurementId": "G-F2VL1BBRGT"
 }
-_auth = None
-_db = None
+FIRESTORE_API = (
+    "https://firestore.googleapis.com/v1/projects/"
+    f"{_firebase_config['projectId']}/databases/(default)/documents"
+)
 
-def _get_firebase():
-    """Initialize Firebase on first call, then cache the result."""
-    global _auth, _db
-    if _auth is None:
-        logger.info("Initializing Firebase (first call)")
+
+FIREBASE_API_KEY = _firebase_config["apiKey"]
+IDENTITY_API = "https://identitytoolkit.googleapis.com/v1/accounts"
+SECURE_TOKEN_API = "https://securetoken.googleapis.com/v1/token"
+
+
+class FirebaseAuthError(Exception):
+    """Sign-in / sign-up failure. `code` is Firebase's own error code."""
+
+    def __init__(self, code, detail=""):
+        self.code = code or "AUTH_FAILED"
+        self.detail = detail or self.code
+        super().__init__(self.code)
+
+
+def _auth_post(url, payload):
+    """POST to Identity Toolkit / Secure Token and return the JSON body."""
+    try:
+        resp = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
+    except requests.RequestException as e:
+        raise FirebaseAuthError(
+            "NETWORK", f"Could not reach Firebase ({e.__class__.__name__})."
+        ) from e
+
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {}
+
+    if resp.status_code >= 400:
+        raw = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+        # Codes arrive as "WEAK_PASSWORD : Password should be at least 6 ..."
+        logger.warning("Firebase auth error: %s", raw)
+        raise FirebaseAuthError(raw.split(":", 1)[0].strip(), raw)
+    return data
+
+
+def _sign_in(email, password):
+    """Email/password sign-in. Returns uid, id token and refresh token."""
+    data = _auth_post(
+        f"{IDENTITY_API}:signInWithPassword?key={FIREBASE_API_KEY}",
+        {"email": email, "password": password, "returnSecureToken": True},
+    )
+    return {
+        "uid": data.get("localId", ""),
+        "id_token": data.get("idToken", ""),
+        "refresh_token": data.get("refreshToken", ""),
+    }
+
+
+def _sign_up(email, password):
+    """Create an account. Returns the same shape as _sign_in()."""
+    data = _auth_post(
+        f"{IDENTITY_API}:signUp?key={FIREBASE_API_KEY}",
+        {"email": email, "password": password, "returnSecureToken": True},
+    )
+    return {
+        "uid": data.get("localId", ""),
+        "id_token": data.get("idToken", ""),
+        "refresh_token": data.get("refreshToken", ""),
+    }
+
+
+class FirebaseError(Exception):
+    """A Firestore failure with a message that is fit to show a user."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+def _fs_value(value):
+    """Encode a Python value as a Firestore REST Value."""
+    if value is None:
+        return {"nullValue": None}
+    if isinstance(value, bool):
+        return {"booleanValue": value}
+    if isinstance(value, int):
+        return {"integerValue": str(value)}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    return {"stringValue": str(value)}
+
+
+def _fs_decode(value):
+    """Decode one Firestore REST Value into a Python value."""
+    if not isinstance(value, dict):
+        return ""
+    if "stringValue" in value:
+        return value["stringValue"]
+    if "booleanValue" in value:
+        return bool(value["booleanValue"])
+    if "integerValue" in value:
         try:
-            firebase = pyrebase.initialize_app(_firebase_config)
-            _auth = firebase.auth()
-            cred = credentials.Certificate("serviceAccountKey.json")
-            firebase_admin.initialize_app(cred)
-            _db = firestore.client()
-            logger.info("Firebase initialized successfully")
-        except Exception:
-            logger.exception("Firebase initialization failed")
+            return int(value["integerValue"])
+        except (TypeError, ValueError):
+            return 0
+    if "doubleValue" in value:
+        return value["doubleValue"]
+    if "timestampValue" in value:
+        return value["timestampValue"]
+    return ""
+
+
+def _fs_request(method, path, id_token, payload=None, allow_missing=False):
+    """One Firestore REST call, authenticated as the signed-in user.
+
+    With allow_missing=True a 404 returns None instead of raising: a first-time
+    user legitimately has no users/{uid} document yet.
+    """
+    if not id_token:
+        raise FirebaseError("Your session expired. Please sign in again.")
+    headers = {"Authorization": f"Bearer {id_token}"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    try:
+        resp = requests.request(
+            method, f"{FIRESTORE_API}/{path}", headers=headers,
+            json=payload, timeout=HTTP_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        raise FirebaseError(f"Could not reach the database ({e.__class__.__name__}).") from e
+
+    if resp.status_code == 404 and allow_missing:
+        return None
+    if resp.status_code in (401, 403):
+        logger.warning("Firestore %s %s -> %d", method, path, resp.status_code)
+        raise FirebaseError(
+            "The database refused the request. Firestore rules must allow the "
+            "signed-in user to read and write their own users/{uid} document.",
+            status=resp.status_code,
+        )
+    if resp.status_code >= 400:
+        detail = ""
+        try:
+            detail = (resp.json().get("error") or {}).get("message", "")
+        except ValueError:
+            pass
+        logger.error("Firestore %s %s -> %d %s", method, path, resp.status_code, detail)
+        raise FirebaseError(
+            f"Database error {resp.status_code}: {detail or resp.text[:120]}",
+            status=resp.status_code,
+        )
+    return resp
+
+
+def _load_profile(uid, id_token):
+    """Read users/{uid}. Returns a dict (empty when the document is missing)."""
+    if not uid:
+        raise FirebaseError("No signed-in user.")
+    resp = _fs_request("GET", f"users/{uid}", id_token, allow_missing=True)
+    if resp is None:
+        return {}
+    fields = (resp.json() or {}).get("fields") or {}
+    return {k: _fs_decode(v) for k, v in fields.items()}
+
+
+def _update_profile(uid, id_token, values):
+    """Merge `values` into users/{uid}, creating the document when absent.
+
+    A value of None deletes that field, which is how the legacy plain-text
+    `pat` field is removed after it has been migrated to the local store.
+    """
+    if not uid:
+        raise FirebaseError("No signed-in user.")
+    mask = "&".join(f"updateMask.fieldPaths={k}" for k in values)
+    payload = {"fields": {k: _fs_value(v) for k, v in values.items()}}
+    try:
+        _fs_request("PATCH", f"users/{uid}?{mask}", id_token, payload)
+    except FirebaseError as e:
+        if e.status != 404:
             raise
-    return _auth, _db
+        # A masked update needs the document to exist; for a brand-new account
+        # create it instead (nulls have nothing to delete).
+        create = {k: v for k, v in values.items() if v is not None}
+        if not create:
+            return
+        _fs_request(
+            "PATCH", f"users/{uid}", id_token,
+            {"fields": {k: _fs_value(v) for k, v in create.items()}},
+        )
+
+
+def _refresh_id_token(user_data):
+    """Firebase ID tokens live for an hour; renew with the refresh token.
+
+    Note the snake_case keys: the Secure Token API returns {id_token,
+    refresh_token}, unlike Identity Toolkit's camelCase.
+    """
+    refresh_token = user_data.get("refresh_token")
+    if not refresh_token:
+        return user_data.get("id_token", "")
+    try:
+        data = _auth_post(
+            f"{SECURE_TOKEN_API}?key={FIREBASE_API_KEY}",
+            {"grant_type": "refresh_token", "refresh_token": refresh_token},
+        )
+        user_data["id_token"] = data.get("id_token", user_data.get("id_token", ""))
+        user_data["refresh_token"] = data.get("refresh_token", refresh_token)
+        logger.info("Firebase session refreshed")
+        return user_data["id_token"]
+    except Exception:
+        logger.exception("Could not refresh the Firebase session")
+        return user_data.get("id_token", "")
+
+
+def _update_user_profile(user_data, values):
+    """Write profile fields for the signed-in user, retrying once after a
+    token refresh so an expired session does not fail a settings save."""
+    uid = user_data.get("uid", "")
+    try:
+        _update_profile(uid, user_data.get("id_token", ""), values)
+    except FirebaseError:
+        token = _refresh_id_token(user_data)
+        if not token:
+            raise
+        _update_profile(uid, token, values)
+
+
+# ================= LOCAL SECRET STORAGE =================
+# The TFS PAT is a credential. Kept in Firestore it was readable by anyone
+# holding the previously shipped service-account key; it is now encrypted with
+# DPAPI for the current Windows user and stored under %LOCALAPPDATA%.
+
+def _credential_dir():
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    path = os.path.join(base, "AutoReport", "credentials")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [
+        ("cbData", ctypes.wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_char)),
+    ]
+
+
+def _dpapi(data, protect=True):
+    """Encrypt (protect=True) or decrypt a blob for the current Windows user."""
+    if not data:
+        return b""
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    buf = ctypes.create_string_buffer(data, len(data))
+    src = _DataBlob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    dst = _DataBlob()
+    call = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    if not call(ctypes.byref(src), None, None, None, None, 0, ctypes.byref(dst)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return ctypes.string_at(dst.pbData, dst.cbData)
+    finally:
+        kernel32.LocalFree(dst.pbData)
+
+
+def _pat_file(uid):
+    return os.path.join(_credential_dir(), f"{uid}.bin")
+
+
+def _save_pat_local(uid, pat):
+    """Store this user's PAT encrypted for this Windows account."""
+    if not uid or not pat:
+        return False
+    try:
+        with open(_pat_file(uid), "wb") as f:
+            f.write(_dpapi(pat.encode("utf-8"), protect=True))
+        logger.info("PAT stored in the local credential store for uid=%s", uid)
+        return True
+    except Exception:
+        logger.exception("Could not store the PAT locally")
+        return False
+
+
+def _load_pat_local(uid):
+    if not uid:
+        return ""
+    try:
+        path = _pat_file(uid)
+        if not os.path.isfile(path):
+            return ""
+        with open(path, "rb") as f:
+            return _dpapi(f.read(), protect=False).decode("utf-8")
+    except Exception:
+        logger.exception("Could not read the stored PAT - it will have to be re-entered")
+        return ""
+
+
+def _delete_pat_local(uid):
+    try:
+        if uid:
+            os.remove(_pat_file(uid))
+    except OSError:
+        pass
 
 
 
@@ -936,8 +1301,10 @@ def insert_html_into_placeholder(doc, placeholder, raw_html, pat=""):
         nonlocal found
         if placeholder in paragraph.text:
             logger.debug("Found %r in paragraph text", placeholder)
-            for run in paragraph.runs:
-                run.text = ""
+            # Remove the placeholder runs instead of blanking them: an emptied
+            # run stayed at the front of the paragraph with its own formatting.
+            for run in list(paragraph.runs):
+                run._r.getparent().remove(run._r)
             add_html_content_to_paragraph(paragraph, raw_html, pat)
             found = True
             return True
@@ -979,61 +1346,154 @@ def insert_html_into_placeholder(doc, placeholder, raw_html, pat=""):
     return False
 
 
+# --- HTML to DOCX rendering ---
+# Tags that end a block of text, and tags whose contents are not content.
+_BLOCK_TAGS = {
+    "p", "div", "li", "ul", "ol", "tr", "table", "blockquote",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+}
+_SKIP_TAGS = {"script", "style", "head"}
+
+# One download per URL per session: the same screenshot is usually pasted into
+# several comments, and it used to be re-fetched for every report.
+_image_cache = {}
+
+
+def _fetch_image_bytes(url, pat=""):
+    """Download an image, resolving TFS-relative src values.
+
+    The PAT is only ever sent to the TFS host itself - the old code attached it
+    to whatever host an <img src> pointed at in the comment.
+    """
+    candidate = (url or "").strip()
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    elif candidate.startswith("/"):
+        candidate = _TFS_HOST + candidate
+
+    if candidate in _image_cache:
+        return _image_cache[candidate]
+
+    if candidate.startswith(_TFS_HOST):
+        resp = requests.get(candidate, auth=HTTPBasicAuth("", pat), timeout=IMAGE_TIMEOUT)
+    else:
+        resp = requests.get(candidate, timeout=IMAGE_TIMEOUT)
+    resp.raise_for_status()
+
+    if len(_image_cache) > 50:
+        _image_cache.clear()
+    _image_cache[candidate] = resp.content
+    return resp.content
+
+
 def add_html_content_to_paragraph(paragraph, html_content, pat=""):
-    """Render HTML content (with images) into a Word paragraph."""
-    logger.debug("Rendering HTML content into paragraph (length=%d chars)", len(html_content))
-    soup = BeautifulSoup(html_content, "html.parser")
+    """Render HTML (text, breaks, lists, bold/italic, images) into a paragraph.
+
+    The old renderer added a break after *every* text node and another one per
+    <p>, so each line of a comment gained a blank line under it; it also
+    flattened the text of plain-text comments into one long line.
+    """
+    logger.debug("Rendering HTML content into paragraph (length=%d chars)", len(html_content or ""))
+    soup = BeautifulSoup(html_content or "", "html.parser")
     img_count = 0
     img_fail_count = 0
+    last_was_break = True   # never start with a break
 
-    def recurse(node, para):
-        nonlocal img_count, img_fail_count
-        if isinstance(node, NavigableString):
-            for line in str(node).splitlines():
-                para.add_run(line)
-                para.add_run().add_break()
-        elif isinstance(node, Tag):
-            if node.name == "br":
-                para.add_run().add_break()
-            elif node.name == "p":
-                for child in node.children:
-                    recurse(child, para)
-                para.add_run().add_break()
-            elif node.name == "li":
-                para.add_run("• ")
-                for child in node.children:
-                    recurse(child, para)
-                para.add_run().add_break()
-            elif node.name == "img":
-                img_url = node.get("src")
-                if img_url:
-                    try:
-                        logger.debug("Fetching image: %s", img_url[:120])
-                        img_resp = requests.get(img_url, auth=HTTPBasicAuth("", pat), timeout=IMAGE_TIMEOUT)
-                        img_resp.raise_for_status()
-                        image_stream = BytesIO(img_resp.content)
-                        image = Image.open(image_stream)
-                        dpi = image.info.get("dpi", (96, 96))[0]
-                        width_inches = image.width / dpi
-                        max_width_inches = 6
-                        image_stream.seek(0)
-                        if width_inches > max_width_inches:
-                            para.add_run().add_picture(image_stream, width=Inches(max_width_inches))
-                        else:
-                            para.add_run().add_picture(image_stream)
-                        img_count += 1
-                        logger.debug("Image inserted successfully (dpi=%s, width=%.2f in)", dpi, width_inches)
-                    except Exception as e:
-                        img_fail_count += 1
-                        logger.error("Error inserting image from %s: %s", img_url[:120], e)
+    def add_break():
+        nonlocal last_was_break
+        if last_was_break:
+            return
+        paragraph.add_run().add_break()
+        last_was_break = True
+
+    def add_text(text, bold=False, italic=False):
+        nonlocal last_was_break
+        for index, line in enumerate(re.split(r"\r\n|\r|\n", str(text))):
+            if index:
+                add_break()
+            collapsed = re.sub(r"[ \t]+", " ", line)
+            if last_was_break:
+                collapsed = collapsed.lstrip()
+            if not collapsed.strip():
+                continue
+            run = paragraph.add_run(collapsed)
+            if bold:
+                run.bold = True
+            if italic:
+                run.italic = True
+            last_was_break = False
+
+    def add_image(url):
+        nonlocal img_count, img_fail_count, last_was_break
+        try:
+            logger.debug("Fetching image: %s", (url or "")[:120])
+            stream = BytesIO(_fetch_image_bytes(url, pat))
+            with Image.open(stream) as probe:
+                dpi = 96.0
+                info = probe.info.get("dpi")
+                if isinstance(info, (tuple, list)) and info and info[0]:
+                    dpi = float(info[0]) or 96.0
+                width_inches = probe.width / dpi
+            stream.seek(0)
+            if width_inches > 6:
+                paragraph.add_run().add_picture(stream, width=Inches(6))
             else:
-                for child in node.children:
-                    recurse(child, para)
+                paragraph.add_run().add_picture(stream)
+            last_was_break = False
+            img_count += 1
+        except Exception as e:
+            img_fail_count += 1
+            logger.error("Error inserting image from %s: %s", (url or "")[:120], e)
+
+    def walk(node, bold=False, italic=False):
+        if isinstance(node, NavigableString):
+            add_text(str(node), bold, italic)
+            return
+        if not isinstance(node, Tag) or node.name in _SKIP_TAGS:
+            return
+
+        name = node.name
+        if name == "br":
+            add_break()
+            return
+        if name == "img":
+            add_image(node.get("src"))
+            return
+
+        if name in ("strong", "b"):
+            bold = True
+        elif name in ("em", "i"):
+            italic = True
+        elif name == "li":
+            add_break()
+            add_text("• ")
+
+        for child in node.children:
+            walk(child, bold, italic)
+
+        if name in _BLOCK_TAGS:
+            add_break()
 
     for child in soup.children:
-        recurse(child, paragraph)
+        walk(child)
 
-    logger.info("HTML rendering complete: %d image(s) inserted, %d failed", img_count, img_fail_count)
+    logger.info("HTML rendering complete: %d image(s) inserted, %d failed",
+                img_count, img_fail_count)
+
+
+def _ui_alive(widget):
+    """True while a widget still exists.
+
+    A worker signal can arrive after the page that connected it has been torn
+    down by clear_layout(), and writing to the dead C++ object raises
+    "wrapped C/C++ object of type QTextEdit has been deleted".
+    """
+    if widget is None:
+        return False
+    try:
+        return not sip.isdeleted(widget)
+    except Exception:
+        return True
 
 
 # ================= CUSTOM DIALOG =================
@@ -1041,9 +1501,11 @@ class AppDialog(QtWidgets.QDialog):
     def __init__(self, title, message, parent=None):
         super().__init__(parent)
 
-        self.setWindowIcon(QtGui.QIcon("asset/death.ico"))
+        self.setWindowIcon(QtGui.QIcon(os.path.join(ASSET_DIR, "death.ico")))
         self.setWindowTitle(title)
-        self.setFixedSize(320, 160)
+        # Minimum, not fixed: the longer error messages (Firestore rules,
+        # "cannot create report folder") were clipped by a fixed 160px height.
+        self.setMinimumSize(320, 160)
         self.setObjectName("Root")
 
         # Use the same dark/light styles as your main window
@@ -1102,6 +1564,7 @@ class AppDialog(QtWidgets.QDialog):
         layout.addWidget(label)
         layout.addStretch()
         layout.addWidget(button)
+        self.adjustSize()
 
 
 class UpdateCheckWorker(QThread):
@@ -1117,6 +1580,126 @@ class UpdateCheckWorker(QThread):
         except Exception:
             logger.exception("Manual update check failed")
             self.found.emit(None)
+
+
+class LoginWorker(QThread):
+    """Signs in and loads the profile off the GUI thread.
+
+    Three network round-trips (Firebase auth, Firestore profile, TFS PAT expiry)
+    ran inline in login(), so the window stopped repainting and Windows drew it
+    as "Not responding" for the whole sign-in.
+    """
+    succeeded = pyqtSignal(object)      # the current_user dict
+    pat_required = pyqtSignal(object)   # profile without a stored PAT
+    failed = pyqtSignal(str)            # message, or a known marker
+
+    def __init__(self, email, password, parent=None):
+        super().__init__(parent)
+        self.email = email
+        self.password = password
+
+    def run(self):
+        try:
+            session = _sign_in(self.email, self.password)
+            uid = session["uid"]
+            id_token = session["id_token"]
+            logger.info("Firebase auth success, uid=%s", uid)
+
+            profile = _load_profile(uid, id_token)
+            if not profile:
+                self.failed.emit("USER_PROFILE_NOT_FOUND")
+                return
+
+            data = {
+                "email": self.email,
+                "uid": uid,
+                "pat": "",
+                "display_name": profile.get("display_name", ""),
+                "unique_name": profile.get("unique_name", ""),
+                "pat_expiry": profile.get("pat_expiry", ""),
+                "id_token": id_token,
+                "refresh_token": session["refresh_token"],
+            }
+
+            # Local store first. Accounts created by older builds still carry
+            # the PAT as a plain field in Firestore; move it once and delete it.
+            pat = _load_pat_local(uid)
+            legacy_pat = profile.get("pat", "")
+            if not pat and legacy_pat:
+                if _save_pat_local(uid, legacy_pat):
+                    pat = legacy_pat
+                    try:
+                        _update_profile(uid, id_token, {"pat": None})
+                        logger.info("Legacy Firestore PAT migrated and removed")
+                    except FirebaseError:
+                        logger.warning(
+                            "Migrated the PAT but could not delete the old field "
+                            "from Firestore - remove users/%s.pat by hand", uid
+                        )
+
+            if not pat:
+                logger.warning("No PAT available locally for uid=%s", uid)
+                self.pat_required.emit(data)
+                return
+
+            data["pat"] = pat
+
+            if not data["pat_expiry"]:
+                expiry = _fetch_pat_expiry(pat)
+                if expiry:
+                    data["pat_expiry"] = expiry
+                    try:
+                        _update_profile(uid, id_token, {"pat_expiry": expiry})
+                        logger.info("PAT expiry saved: %s", expiry)
+                    except FirebaseError:
+                        logger.warning("Could not save the PAT expiry")
+
+            self.succeeded.emit(data)
+        except FirebaseAuthError as e:
+            # The code alone ("INVALID_LOGIN_CREDENTIALS", "NETWORK", ...) is
+            # what the dialog maps to a readable sentence.
+            logger.warning("Sign-in failed for %r: %s", self.email, e.detail)
+            self.failed.emit(e.code)
+        except Exception as e:
+            logger.exception("Login failed for %r", self.email)
+            self.failed.emit(str(e))
+
+
+class UpdateDownloadWorker(QThread):
+    """Downloads and verifies the release asset off the GUI thread.
+
+    The download used to run inside UpdateDialog with processEvents() pumping
+    the progress bar. That let the user hit Skip mid-transfer, after which the
+    progress callback was still writing into the destroyed dialog.
+    """
+    progress = pyqtSignal(int, int)   # bytes done, bytes total
+    downloaded = pyqtSignal(str)      # verified local path
+    failed = pyqtSignal(str)
+
+    def __init__(self, url, expected_size=None, expected_digest=None, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.expected_size = expected_size
+        self.expected_digest = expected_digest
+
+    def run(self):
+        try:
+            path = _download_update(
+                self.url,
+                progress_callback=lambda done, total: self.progress.emit(done, total),
+                expected_size=self.expected_size,
+                expected_digest=self.expected_digest,
+            )
+        except Exception:
+            logger.exception("Update download crashed")
+            path = None
+        if path:
+            self.downloaded.emit(path)
+        else:
+            self.failed.emit(
+                "Download failed after 3 attempts. Nothing was installed; "
+                "the details are in report_log.txt."
+            )
 
 
 class UpdateDialog(QtWidgets.QDialog):
@@ -1228,52 +1811,87 @@ class UpdateDialog(QtWidgets.QDialog):
         layout.addLayout(btn_layout)
 
     def _on_download(self):
+        update_info = getattr(self.parent(), "_update_info", None) if self.parent() else None
+        if not update_info:
+            self.status_label.setVisible(True)
+            self.status_label.setText("Error: No update info")
+            return
+
+        asset_type = update_info.get("asset_type", "exe")
+        if asset_type != "zip" and not update_info.get("digest"):
+            # An .exe is executed, not inspected: without the SHA-256 the
+            # release can publish there is nothing to check but its length.
+            self.status_label.setVisible(True)
+            self.status_label.setText(
+                "This release publishes no SHA-256 digest for the installer, so "
+                "it cannot be verified. Ask for a .zip release."
+            )
+            return
+
         self.download_btn.setEnabled(False)
         self.download_btn.setText("Downloading...")
         self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
         self.status_label.setVisible(True)
         self.status_label.setText("Starting download...")
-        QtWidgets.QApplication.processEvents()
 
-        def on_progress(done, total):
-            pct = int(done / total * 100)
-            self.progress_bar.setValue(pct)
-            mb_done = done / (1024 * 1024)
-            mb_total = total / (1024 * 1024)
-            self.status_label.setText(f"{mb_done:.1f} MB / {mb_total:.1f} MB")
-            QtWidgets.QApplication.processEvents()
-
-        # Get update info from the parent
-        update_info = getattr(self.parent(), "_update_info", None) if self.parent() else None
-        if not update_info:
-            self.status_label.setText("Error: No update info")
-            self.download_btn.setEnabled(True)
-            self.download_btn.setText("Download Update")
-            return
-
-        url = update_info["download_url"]
-        asset_type = update_info.get("asset_type", "exe")
-
-        path = _download_update(
-            url,
-            progress_callback=on_progress,
+        self._download_worker = UpdateDownloadWorker(
+            update_info["download_url"],
             expected_size=update_info.get("size"),
             expected_digest=update_info.get("digest"),
+            parent=self,
         )
-        if not path:
+        self._download_worker.progress.connect(self._on_download_progress)
+        self._download_worker.downloaded.connect(
+            lambda path: self._install(path, update_info)
+        )
+        self._download_worker.failed.connect(self._on_download_failed)
+        self._download_worker.start()
+
+    def _on_download_progress(self, done, total):
+        if not _ui_alive(self.progress_bar):
+            return
+        if total:
+            self.progress_bar.setValue(int(done / total * 100))
             self.status_label.setText(
-                "Download failed after 3 attempts. Nothing was installed; "
-                "the details are in report_log.txt."
+                f"{done / (1024 * 1024):.1f} MB / {total / (1024 * 1024):.1f} MB"
             )
-            self.download_btn.setEnabled(True)
-            self.download_btn.setText("Retry")
-            self.download_btn.clicked.disconnect()
-            self.download_btn.clicked.connect(self._on_download)
+        else:
+            self.status_label.setText(f"{done / (1024 * 1024):.1f} MB")
+
+    def _on_download_failed(self, message):
+        if not _ui_alive(self.download_btn):
+            return
+        self.status_label.setText(message)
+        self.download_btn.setEnabled(True)
+        self.download_btn.setText("Retry")
+
+    def closeEvent(self, event):
+        """Refuse to close mid-download: the worker writes into this dialog."""
+        worker = getattr(self, "_download_worker", None)
+        if worker is not None and worker.isRunning():
+            self.status_label.setText("Please wait - the download is still running.")
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def reject(self):
+        """Esc must not tear the dialog down while the download is in flight."""
+        worker = getattr(self, "_download_worker", None)
+        if worker is not None and worker.isRunning():
+            self.status_label.setText("Please wait - the download is still running.")
+            return
+        super().reject()
+
+    def _install(self, path, update_info):
+        """Apply a verified download. Runs on the GUI thread, after the
+        transfer has finished."""
+        if not _ui_alive(self.download_btn):
             return
 
         self.progress_bar.setValue(100)
 
-        if asset_type == "zip":
+        if update_info.get("asset_type", "exe") == "zip":
             # Extract and replace files in-place
             self.status_label.setText("Verifying and installing update...")
             self.download_btn.setText("Applying update...")
@@ -1288,9 +1906,7 @@ class UpdateDialog(QtWidgets.QDialog):
             else:
                 # Say what actually went wrong: the old build is still intact.
                 self.status_label.setText(message or "Failed to apply update.")
-                self.download_btn.setText("Close")
-                self.download_btn.setEnabled(True)
-                self.download_btn.clicked.connect(self.accept)
+                self._turn_download_button_into_close()
         else:
             # .exe — launch installer and exit
             self.status_label.setText("Download complete! Launching installer...")
@@ -1304,9 +1920,23 @@ class UpdateDialog(QtWidgets.QDialog):
             except Exception:
                 logger.exception("Failed to launch update installer")
                 self.status_label.setText(f"Downloaded to: {path}")
-                self.download_btn.setText("Close")
-                self.download_btn.setEnabled(True)
-                self.download_btn.clicked.connect(self.accept)
+                self._turn_download_button_into_close()
+
+    def _turn_download_button_into_close(self):
+        """Swap the button's action for `accept`.
+
+        Connecting accept() without disconnecting _on_download left both
+        handlers on the same click, so "Close" started a second download.
+        """
+        if not _ui_alive(self.download_btn):
+            return
+        self.download_btn.setText("Close")
+        self.download_btn.setEnabled(True)
+        try:
+            self.download_btn.clicked.disconnect()
+        except TypeError:
+            pass
+        self.download_btn.clicked.connect(self.accept)
 
     def _restart_app(self):
         """Restart the application after a zip update."""
@@ -2590,11 +3220,12 @@ class AyalaCheckerDialog(QDialog):
 
 
 # ================= MAIN WINDOW =================
-
-
 class ReportWorker(QThread):
         progress = pyqtSignal(str)  # signal to update status
-        finished = pyqtSignal(str)  # signal when done
+        # NOT named `finished`: QThread already owns a zero-argument `finished`
+        # signal and redefining it here shadowed that one, so the thread's real
+        # completion was unobservable (and an emit with no argument could raise).
+        done = pyqtSignal(str)
         report_saved = pyqtSignal(str)
 
         def __init__(self, work_item_id, client_name, location_type1, location_type2, user_data, template_path):
@@ -2622,7 +3253,7 @@ class ReportWorker(QThread):
                 logger.info("Work item fetched: id=%s, title=%r", work_item_data.get("id"), work_item_data.get("fields", {}).get("System.Title", "")[:80])
             except Exception as e:
                 logger.exception("Failed to fetch work item %s", self.work_item_id)
-                self.finished.emit(f"❌ Error fetching work item: {e}")
+                self.done.emit(f"❌ Error fetching work item: {e}")
                 return
 
             ticket_number = work_item_data.get("id")
@@ -2639,7 +3270,7 @@ class ReportWorker(QThread):
                 logger.info("Fetched %d comment(s) for work item %s", total_comments, self.work_item_id)
             except Exception as e:
                 logger.exception("Failed to fetch comments for work item %s", self.work_item_id)
-                self.finished.emit(f"❌ Error fetching comments: {e}")
+                self.done.emit(f"❌ Error fetching comments: {e}")
                 return
 
             my_comments = [
@@ -2650,7 +3281,7 @@ class ReportWorker(QThread):
             logger.debug("Matched %d comment(s) for user displayName=%r, uniqueName=%r", len(my_comments), my_display_name, my_unique_name)
             if not my_comments:
                 logger.warning("No comments found for user %r on work item %s", my_display_name, self.work_item_id)
-                self.finished.emit("❌ No comments found for your account.")
+                self.done.emit("❌ No comments found for your account.")
                 return
 
             latest_comment = sorted(my_comments, key=lambda x: x.get("createdDate", ""))[-1]
@@ -2739,9 +3370,21 @@ class ReportWorker(QThread):
             self.next_step = next_step
             self.status = status
 
-            today_folder = datetime.now().strftime("%m-%d-%Y")
-            os.makedirs(today_folder, exist_ok=True)
-            output_filename = f"Ticket No. {self.work_item_id} - Status Report for {self.client_name}.docx"
+            # Anchored to the app directory, not the working directory.
+            today_folder = os.path.join(REPORTS_DIR, datetime.now().strftime("%m-%d-%Y"))
+            try:
+                os.makedirs(today_folder, exist_ok=True)
+            except OSError as e:
+                # Without this the thread died silently and the Generate button
+                # stayed disabled forever (the UI is only re-enabled by a
+                # signal, and no signal used to be emitted here).
+                logger.exception("Cannot create the report folder")
+                self.done.emit(f"❌ Cannot create {today_folder}: {e}")
+                return
+            output_filename = (
+                f"Ticket No. {_safe_filename(self.work_item_id)} - "
+                f"Status Report for {_safe_filename(self.client_name)}.docx"
+            )
             output_path = os.path.join(today_folder, output_filename)
             self.last_output_path = output_path
             logger.info("Output path: %s", output_path)
@@ -2751,7 +3394,7 @@ class ReportWorker(QThread):
                 logger.info("Loading template: %s", self.template_path)
                 if not os.path.isfile(self.template_path):
                     logger.error("Template file NOT FOUND: %s (cwd=%s)", self.template_path, os.getcwd())
-                    self.finished.emit(f"❌ Template not found: {self.template_path}")
+                    self.done.emit(f"❌ Template not found: {self.template_path}")
                     return
                 doc = Document(self.template_path)
                 logger.info("Template loaded successfully (%d paragraph(s), %d table(s))", len(doc.paragraphs), len(doc.tables))
@@ -2784,10 +3427,10 @@ class ReportWorker(QThread):
                 doc.save(output_path)
                 logger.info("Report saved successfully: %s", output_path)
                 self.report_saved.emit(output_path)
-                self.finished.emit(f"✅ Report saved for ticket number: {self.work_item_id}")
+                self.done.emit(f"✅ Report saved for ticket number: {self.work_item_id}")
             except Exception as e:
                 logger.exception("Error generating report for work item %s", self.work_item_id)
-                self.finished.emit(f"❌ Error generating report: {e}")
+                self.done.emit(f"❌ Error generating report: {e}")
 
 class PotTicketDataWorker(QThread):
     """
@@ -2795,7 +3438,7 @@ class PotTicketDataWorker(QThread):
     TFS work item, so it can be inserted into {{TICKETDATA}}.
     """
     progress = pyqtSignal(str)
-    finished = pyqtSignal(str)   # emits raw_html on success, "" on failure
+    done = pyqtSignal(str)       # emits raw_html on success
     error = pyqtSignal(str)      # emits error message on failure
 
     def __init__(self, work_item_id, user_data):
@@ -2806,8 +3449,6 @@ class PotTicketDataWorker(QThread):
 
     def run(self):
         logger.info("=== PotTicketDataWorker started for work item %s ===", self.work_item_id)
-        import requests
-        from requests.auth import HTTPBasicAuth
 
         pat = self.user_data["pat"]
         my_display_name = self.user_data["display_name"]
@@ -2844,7 +3485,7 @@ class PotTicketDataWorker(QThread):
         self.raw_html = latest_comment.get("text", "")
         logger.info("POT comment fetched: %d chars of HTML", len(self.raw_html))
 
-        self.finished.emit(self.raw_html)
+        self.done.emit(self.raw_html)
 
 class LoginWindow(QtWidgets.QWidget):
     def __init__(self):
@@ -3314,7 +3955,7 @@ class LoginWindow(QtWidgets.QWidget):
                 img_label.setContentsMargins(0, 0, 0, 12)
                 layout.addWidget(img_label)
             else:
-                print(f"Warning: Screenshot not found at {screenshot}")
+                logger.warning("Screenshot not found: %s", screenshot)
 
         # Title
         title = QtWidgets.QLabel(title_text)
@@ -3394,7 +4035,7 @@ class LoginWindow(QtWidgets.QWidget):
             "Next",           # button text
             self.save_pat,    # handler
             pat=True,
-            screenshot="asset/picture01.png"
+            screenshot=os.path.join(ASSET_DIR, "picture01.png")
         )
 
     def save_pat(self):
@@ -3413,7 +4054,7 @@ class LoginWindow(QtWidgets.QWidget):
             "Finish Setup",
             self.save_display_name,
             display=True,
-            screenshot="asset/picture1.png"  # <-- Put your screenshot path here
+            screenshot=os.path.join(ASSET_DIR, "picture1.png")
         )
 
     # Replace the save_display_name method with this:
@@ -3434,7 +4075,7 @@ class LoginWindow(QtWidgets.QWidget):
             "Finish Setup",
             self.save_unique_name,
             display=True,  # reuse the input field type
-            screenshot="asset/picture2.png"  # optional screenshot for professionalism
+            screenshot=os.path.join(ASSET_DIR, "picture2.png")
         )
 
     def save_unique_name(self):
@@ -3450,34 +4091,40 @@ class LoginWindow(QtWidgets.QWidget):
             self.action_button.setText("Creating Account...")
             QApplication.processEvents()
 
-            auth, db = _get_firebase()
-            user = auth.create_user_with_email_and_password(
-                self.temp_username,
-                self.temp_password
-            )
-
-            uid = user["localId"]
+            session = _sign_up(self.temp_username, self.temp_password)
+            uid = session["uid"]
+            id_token = session["id_token"]
             logger.info("Firebase user created, uid=%s", uid)
 
             self.action_button.setText("Saving User Data...")
             QApplication.processEvents()
 
-            db.collection("users").document(uid).set({
+            # The PAT never leaves this machine: it goes into the DPAPI store.
+            if not _save_pat_local(uid, self.temp_pat):
+                logger.error("PAT could not be stored locally for uid=%s", uid)
+                self.action_button.setEnabled(True)
+                self.action_button.setText("Finish Setup")
+                AppDialog(
+                    "Error",
+                    "Your PAT could not be stored securely on this PC.\n"
+                    "Please try again.",
+                    self,
+                ).exec()
+                return
+
+            _update_profile(uid, id_token, {
                 "display_name": self.temp_display_name,
                 "unique_name": unique_name,
-                "pat": self.temp_pat
             })
-            logger.info("Firestore profile saved for uid=%s", uid)
+            logger.info("Profile saved for uid=%s", uid)
 
             # Try to fetch PAT expiry and save it
             self.action_button.setText("Checking PAT expiry...")
             QApplication.processEvents()
             pat_expiry = _fetch_pat_expiry(self.temp_pat)
             if pat_expiry:
-                db.collection("users").document(uid).update({
-                    "pat_expiry": pat_expiry
-                })
-                logger.info("PAT expiry saved to Firestore: %s", pat_expiry)
+                _update_profile(uid, id_token, {"pat_expiry": pat_expiry})
+                logger.info("PAT expiry saved: %s", pat_expiry)
             else:
                 logger.info("PAT expiry could not be determined (will retry on login)")
 
@@ -3861,14 +4508,13 @@ class LoginWindow(QtWidgets.QWidget):
 
         logger.info("Saving PAT expiry: %s", expiry_str)
         try:
-            auth, db = _get_firebase()
-
-            db.collection("users").document(uid).update({
-                "pat_expiry": expiry_str
-            })
+            _update_user_profile(self.current_user, {"pat_expiry": expiry_str})
             self.current_user["pat_expiry"] = expiry_str
-            logger.info("PAT expiry saved to Firestore for uid=%s", uid)
+            logger.info("PAT expiry saved for uid=%s", uid)
             self.settings_status.setText(f"Saved! Expiry: {expiry_date.toString('MM/dd/yyyy')}")
+        except FirebaseError as e:
+            logger.exception("Failed to save PAT expiry")
+            self.settings_status.setText(str(e))
         except Exception:
             logger.exception("Failed to save PAT expiry")
             self.settings_status.setText("Failed to save. Check logs.")
@@ -4092,7 +4738,20 @@ class LoginWindow(QtWidgets.QWidget):
 
         # Click handler
         handler_name = tool.get("handler", "")
-        row.mousePressEvent = lambda event, h=handler_name: self._on_tool_clicked(h)
+        available = tool.get("available", tool.get("id") not in UNFINISHED_TOOL_IDS)
+        if not available:
+            # A placeholder row that looks identical to a working one is a lie
+            # to the user: mute it, label it, and leave it inert.
+            name_label.setStyleSheet(f"""
+                font-size: 13px; font-weight: 600; color: {tc['back_color']};
+                background: transparent; border: none;
+            """)
+            desc_label.setText(f"{tool.get('description', '')} (coming soon)")
+            row.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+            row.mousePressEvent = lambda event: None
+            arrow.setText("")
+        else:
+            row.mousePressEvent = lambda event, h=handler_name: self._on_tool_clicked(h)
 
         return row
 
@@ -4233,134 +4892,89 @@ class LoginWindow(QtWidgets.QWidget):
             return
 
         logger.info("Login attempt for email=%r", email)
-        try:
-            self.login_btn.setEnabled(False)
-            self.login_btn.setText("Signing in...")
-            QApplication.processEvents()
+        self.login_btn.setEnabled(False)
+        self.login_btn.setText("Signing in...")
 
-            # Firebase Authentication login
-            auth, db = _get_firebase()
-            user = auth.sign_in_with_email_and_password(email, password)
-            uid = user["localId"]
-            logger.info("Firebase auth success, uid=%s", uid)
+        # Auth, profile and PAT expiry all happen on the worker: doing them here
+        # froze the window (three network round-trips) on every sign-in.
+        self._login_worker = LoginWorker(email, password, self)
+        self._login_worker.succeeded.connect(self._on_login_succeeded)
+        self._login_worker.pat_required.connect(self._on_login_needs_pat)
+        self._login_worker.failed.connect(self._on_login_failed)
+        self._login_worker.start()
 
-            self.login_btn.setText("Fetching Profile...")
-            QApplication.processEvents()
-
-            # Fetch user profile from Firestore
-            doc = db.collection("users").document(uid).get()
-
-            if not doc.exists:
-                raise Exception("USER_PROFILE_NOT_FOUND")
-
-            user_data = doc.to_dict()
-            logger.info("Firestore profile loaded: display_name=%r", user_data.get("display_name"))
-
-            # Store current user in memory
-            self.current_user = {
-                "email": email,
-                "uid": uid,
-                "pat": user_data.get("pat", ""),
-                "display_name": user_data.get("display_name", ""),
-                "unique_name": user_data.get("unique_name", ""),
-                "pat_expiry": user_data.get("pat_expiry", ""),
-            }
-
-            # If pat_expiry is missing from Firestore, try to fetch and save it
-            if not self.current_user["pat_expiry"] and self.current_user["pat"]:
-                logger.info("pat_expiry missing in Firestore — fetching from TFS")
-                self.login_btn.setText("Checking PAT expiry...")
-                QApplication.processEvents()
-                pat_expiry = _fetch_pat_expiry(self.current_user["pat"])
-                if pat_expiry:
-                    db.collection("users").document(uid).update({
-                        "pat_expiry": pat_expiry
-                    })
-                    self.current_user["pat_expiry"] = pat_expiry
-                    logger.info("PAT expiry saved to Firestore: %s", pat_expiry)
-                else:
-                    logger.info("PAT expiry could not be determined")
-
-            AppDialog(
-                "Welcome",
-                f"Hello {self.current_user['display_name']}!\nYou have successfully logged in.",
-                self
-            ).exec()
-
-            # self.show_report_page()
-            self.show_main_menu_page()
-        except Exception as e:
+    def _reset_login_button(self):
+        if _ui_alive(getattr(self, "login_btn", None)):
             self.login_btn.setEnabled(True)
             self.login_btn.setText("Login")
 
-            error_message = str(e)
-            logger.warning("Login failed for %r: %s", email, error_message)
+    def _on_login_succeeded(self, user_data):
+        self.current_user = user_data
+        if _ui_alive(getattr(self, "password", None)):
+            self.password.clear()
+        logger.info("Signed in as %r (uid=%s)",
+                    user_data.get("email"), user_data.get("uid"))
 
-            if "INVALID_LOGIN_CREDENTIALS" in error_message:
-                friendly_message = "Invalid email or password."
-            elif "EMAIL_NOT_FOUND" in error_message:
-                friendly_message = "No account found with this email."
-            elif "INVALID_PASSWORD" in error_message:
-                friendly_message = "Incorrect password."
-            elif "USER_DISABLED" in error_message:
-                friendly_message = "This account has been disabled."
-            elif "USER_PROFILE_NOT_FOUND" in error_message:
-                friendly_message = "Account found, but profile data is missing."
-            else:
-                friendly_message = "Login failed.\nPlease try again later."
-
-            AppDialog("Login Error", friendly_message, self).exec()
-
-    def show_azure_report_page(self):
-        # Clear the current layout
-        self.clear_layout()
-
-        card = QtWidgets.QWidget()
-        card.setObjectName("Card")
-        card.setFixedWidth(400)
-        layout = QtWidgets.QVBoxLayout(card)
-        layout.setContentsMargins(28, 28, 28, 28)
-        layout.setSpacing(12)
-
-        # Title
-        title = QtWidgets.QLabel("Create Azure Status Report")
-        title.setObjectName("Title")
-        layout.addWidget(title)
-
-        # Subtitle
-        subtitle = QtWidgets.QLabel("Fill in Azure-specific details to continue")
-        subtitle.setObjectName("Subtitle")
-        subtitle.setWordWrap(True)
-        layout.addWidget(subtitle)
-
-        # Example input field
-        self.azure_comment_input = QtWidgets.QLineEdit()
-        self.azure_comment_input.setPlaceholderText("Additional comment for Azure report")
-        layout.addWidget(self.azure_comment_input)
-
-        # Continue button
-        continue_btn = QtWidgets.QPushButton("Submit Azure Report")
-        continue_btn.clicked.connect(self.submit_azure_report)
-        layout.addWidget(continue_btn)
-
-        self.main_layout.addWidget(card, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
-
-
-    def submit_azure_report(self):
-        comment = self.azure_comment_input.text().strip()
-        if not comment:
-            AppDialog("Error", "Please enter a comment", self).exec()
+        # The user may have navigated away while the worker was running.
+        if not _ui_alive(getattr(self, "login_btn", None)):
             return
 
-        # Here you can implement Azure report logic
-        AppDialog("Success", "Azure report submitted!", self).exec()
-
-        # Optionally return to report page
-        # self.show_report_page()
+        AppDialog(
+            "Welcome",
+            f"Hello {user_data.get('display_name', '')}!\nYou have successfully logged in.",
+            self
+        ).exec()
         self.show_main_menu_page()
-    
+
+    def _on_login_needs_pat(self, pending):
+        """No PAT on this machine - a new PC, or the credential file was lost.
+        Ask once and keep it locally instead of in the shared database."""
+        if not _ui_alive(getattr(self, "login_btn", None)):
+            return
+        self._reset_login_button()
+        pat, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Personal Access Token",
+            "Your TFS token is not stored on this PC.\nEnter it to continue:",
+            QtWidgets.QLineEdit.EchoMode.Password,
+        )
+        if not ok or not pat.strip():
+            return
+        if not _save_pat_local(pending.get("uid", ""), pat.strip()):
+            AppDialog("Error", "The PAT could not be stored securely on this PC.", self).exec()
+            return
+        pending["pat"] = pat.strip()
+        self._on_login_succeeded(pending)
+
+    def _on_login_failed(self, error_message):
+        self._reset_login_button()
+        logger.warning("Login failed: %s", error_message)
+
+        if "INVALID_LOGIN_CREDENTIALS" in error_message or "INVALID_PASSWORD" in error_message:
+            friendly_message = "Invalid email or password."
+        elif error_message == "NETWORK" or "Could not reach" in error_message:
+            friendly_message = "Could not reach the internet.\nCheck your connection and try again."
+        elif error_message == "TOO_MANY_ATTEMPTS_TRY_LATER":
+            friendly_message = "Too many attempts.\nWait a few minutes and try again."
+        elif "EMAIL_NOT_FOUND" in error_message:
+            friendly_message = "No account found with this email."
+        elif "USER_DISABLED" in error_message:
+            friendly_message = "This account has been disabled."
+        elif "USER_PROFILE_NOT_FOUND" in error_message:
+            friendly_message = "Account found, but profile data is missing."
+        elif error_message.startswith(("The database", "Database error", "Could not reach")):
+            # Already written for a human - hiding it is what made a rules
+            # problem look like a wrong password.
+            friendly_message = error_message
+        else:
+            friendly_message = "Login failed.\nPlease try again later."
+
+        AppDialog("Login Error", friendly_message, self).exec()
 
     def handle_report_finished(self, msg):
+        if not _ui_alive(getattr(self, "output_area", None)):
+            logger.info("Report finished after the page was closed: %s", msg)
+            return
         self.output_area.append(msg)
 
         # Re-enable inputs
@@ -4627,28 +5241,36 @@ class LoginWindow(QtWidgets.QWidget):
         QApplication.processEvents()
 
         self.pot_ticket_worker = PotTicketDataWorker(work_item_id, self.current_user)
-        self.pot_ticket_worker.progress.connect(
-            lambda msg: self.status_label.setText(msg) if hasattr(self, "status_label") else None
-        )
-        self.pot_ticket_worker.finished.connect(self._on_pot_ticket_data_fetched)
+        self.pot_ticket_worker.progress.connect(self._on_pot_ticket_progress)
+        self.pot_ticket_worker.done.connect(self._on_pot_ticket_data_fetched)
         self.pot_ticket_worker.error.connect(self._on_pot_ticket_data_error)
         self.pot_ticket_worker.start()
 
 
+    def _on_pot_ticket_progress(self, msg):
+        if _ui_alive(getattr(self, "status_label", None)):
+            self.status_label.setText(msg)
+
     def _on_pot_ticket_data_error(self, msg):
+        if not _ui_alive(getattr(self, "generate_btn", None)):
+            logger.info("POT fetch failed after the page was closed: %s", msg)
+            return
         self.generate_btn.setEnabled(True)
         self.generate_btn.setText("Generate POT")
-        if hasattr(self, "status_label"):
+        if _ui_alive(getattr(self, "status_label", None)):
             self.status_label.setText(msg)
 
 
     def _on_pot_ticket_data_fetched(self, raw_html):
         logger.info("POT ticket data received: %d chars of HTML", len(raw_html))
+        if not _ui_alive(getattr(self, "generate_btn", None)):
+            logger.info("POT data arrived after the page was closed - discarded")
+            return
         self.generate_btn.setEnabled(True)
         self.generate_btn.setText("Generate POT")
 
         # --- Load the Word template ---
-        pot_template_path = "POT_Template.docx"
+        pot_template_path = POT_TEMPLATE_PATH
         logger.info("Loading POT template: %s (cwd=%s)", pot_template_path, os.getcwd())
         if not os.path.isfile(pot_template_path):
             logger.error("POT template NOT FOUND: %s", pot_template_path)
@@ -4689,12 +5311,12 @@ class LoginWindow(QtWidgets.QWidget):
         self._insert_html_into_placeholder(doc, "{{TICKETDATA}}", raw_html)
 
         # --- Generate output file name safely ---
-        ticket = self.ticket_input.text().strip().replace(" ", "_")
-        company = self.company_input.text().strip().replace(" ", "_")
+        ticket = _safe_filename(self.ticket_input.text().strip().replace(" ", "_"))
+        company = _safe_filename(self.company_input.text().strip().replace(" ", "_"))
         output_filename = f"TFS{ticket}_WebPOS_{company}_POT_Internal_Passv1.0.docx"
 
-        # Save into the same dated folder as status reports (MM-DD-YYYY)
-        today_folder = datetime.now().strftime("%m-%d-%Y")
+        # Same dated folder as the status reports, under the app directory
+        today_folder = os.path.join(REPORTS_DIR, datetime.now().strftime("%m-%d-%Y"))
         os.makedirs(today_folder, exist_ok=True)
         output_path = os.path.join(today_folder, output_filename)
 
@@ -4715,7 +5337,7 @@ class LoginWindow(QtWidgets.QWidget):
         if hasattr(self, "status_label"):
             self.status_label.setText(f"✅ POT generated and saved to {output_path}")
         else:
-            print(f"POT generated: {output_path}")
+            logger.info("POT generated: %s", output_path)
 
 
     def _insert_html_into_placeholder(self, doc, placeholder, raw_html):
@@ -4727,15 +5349,19 @@ class LoginWindow(QtWidgets.QWidget):
         return insert_html_into_placeholder(doc, placeholder, raw_html, pat)
 
     def open_report_folder(self):
-        if hasattr(self, "last_output_path"):
-            folder = os.path.dirname(os.path.abspath(self.last_output_path))  # get absolute folder path
-            print("Trying to open folder:", folder)  # debug print
-            if os.path.exists(folder):
-                os.startfile(folder)  # open folder in Explorer
-            else:
-                print("Folder does not exist:", folder)
+        """Open the folder holding the last generated document.
+
+        Uses the logger instead of print(): a windowed build has no stdout.
+        """
+        path = getattr(self, "last_output_path", "")
+        if not path:
+            logger.info("Open folder clicked, but nothing has been generated yet")
+            return
+        folder = os.path.dirname(os.path.abspath(path))
+        if os.path.isdir(folder):
+            os.startfile(folder)  # Windows-only app; opens Explorer
         else:
-            print("No last_output_path set yet")
+            logger.warning("Report folder does not exist: %s", folder)
     
     
 
@@ -4910,8 +5536,9 @@ class LoginWindow(QtWidgets.QWidget):
 
         # --- Get current time ---
         try:
-            tz = pytz.timezone(timezone_str)
-            now = datetime.now(tz)
+            # zoneinfo (stdlib) replaces pytz; Windows needs the tzdata package,
+            # which is now in requirements.txt.
+            now = datetime.now(ZoneInfo(timezone_str))
             current_time = now.strftime("%m/%d/%Y %I:%M %p %Z").lstrip("0").replace("/0", "/")
         except Exception as e:
             now = datetime.now()
@@ -5035,17 +5662,25 @@ class LoginWindow(QtWidgets.QWidget):
         )
 
         # Connect signals
-        self.worker.progress.connect(lambda msg: self.output_area.append(msg))
-        self.worker.finished.connect(self.handle_report_finished)
+        self.worker.progress.connect(self._on_report_progress)
+        self.worker.done.connect(self.handle_report_finished)
         self.worker.report_saved.connect(self.on_report_saved)
 
         # Start worker
         self.worker.start()
 
+    def _on_report_progress(self, message):
+        """Progress arrives from a worker, possibly after this page is gone."""
+        if _ui_alive(getattr(self, "output_area", None)):
+            self.output_area.append(message)
+        else:
+            logger.debug("Report progress after the page was closed: %s", message)
+
     def on_report_saved(self, path):
         self.last_output_path = path
-        self.open_folder_btn.setEnabled(True)
-        print("Report saved at:", path)
+        if _ui_alive(getattr(self, "open_folder_btn", None)):
+            self.open_folder_btn.setEnabled(True)
+        logger.info("Report saved at: %s", path)
 
 
  
@@ -5147,8 +5782,18 @@ def _cleanup_update_artifacts():
         except OSError:
             logger.warning("Could not remove %s", UPDATE_FAILED_FILE)
 
-    for path in (os.path.join(app_dir, "_update_swap.bat"),
-                 os.path.join(tempfile.gettempdir(), "update_extract")):
+    # Each download now gets its own mkdtemp() folder (autoreport_update_*);
+    # collect any that an earlier run left behind.
+    temp_root = tempfile.gettempdir()
+    stale_dirs = []
+    try:
+        stale_dirs = [os.path.join(temp_root, n) for n in os.listdir(temp_root)
+                      if n.startswith("autoreport_update_")]
+    except OSError:
+        pass
+
+    for path in ([os.path.join(app_dir, "_update_swap.bat"),
+                  os.path.join(tempfile.gettempdir(), "update_extract")] + stale_dirs):
         try:
             if os.path.isdir(path):
                 shutil.rmtree(path, ignore_errors=True)
@@ -5168,21 +5813,34 @@ def _cleanup_update_artifacts():
 
 
 
+_DARK_MODE = None
+
+
 def is_windows_dark_mode():
+    """Cached theme lookup.
+
+    This used to open (and never close) the registry key on every dialog and
+    every stylesheet build, leaking a handle each time.
+    """
+    global _DARK_MODE
+    if _DARK_MODE is not None:
+        return _DARK_MODE
+
+    key = None
     try:
-        registry = winreg.ConnectRegistry(None, winreg.HKEY_CURRENT_USER)
         key = winreg.OpenKey(
-            registry,
-            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
         )
-
-        # 0 = Dark Mode
-        # 1 = Light Mode
+        # 0 = dark, 1 = light
         value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-
-        return value == 0
+        _DARK_MODE = (value == 0)
     except Exception:
-        return True
+        _DARK_MODE = True
+    finally:
+        if key is not None:
+            key.Close()
+    return _DARK_MODE
 
 # ------------------- Splash Screen -------------------
 class SplashScreen(QWidget):
@@ -5211,6 +5869,19 @@ class SplashScreen(QWidget):
         layout.addWidget(label)
         self.setLayout(layout)    
 
+
+
+def _offer_update(window, update):
+    """Show the update dialog when there is one and the window still exists."""
+    if not update:
+        logger.info("No update available")
+        return
+    if not _ui_alive(window):
+        logger.info("Update %s available, but the window is gone", update.get("version"))
+        return
+    logger.info("Update available: %s", update["version"])
+    window._update_info = update
+    UpdateDialog(update["version"], update["body"], parent=window).exec()
 
 
 if __name__ == "__main__":
@@ -5244,7 +5915,7 @@ if __name__ == "__main__":
     logger.info("=== Application starting (cwd=%s) ===", os.getcwd())
     logger.info("Python %s, frozen=%s", sys.version, getattr(sys, 'frozen', False))
 
-    app.setWindowIcon(QtGui.QIcon("asset/death.ico"))
+    app.setWindowIcon(QtGui.QIcon(os.path.join(ASSET_DIR, "death.ico")))
 
     # Show splash screen first
     splash = SplashScreen()
@@ -5264,16 +5935,16 @@ if __name__ == "__main__":
         # This clears the trial marker that _recover_failed_update() checks.
         _mark_update_ok()
 
-        # Check for updates after UI is visible (non-blocking)
+        # Check for updates after the UI is visible, on a worker. The HTTPS
+        # request used to run on the GUI thread here, so a slow network stalled
+        # the app right after the splash screen disappeared.
         def check_update():
-            update = _check_for_update()
-            if update:
-                logger.info("Update available: %s", update["version"])
-                window._update_info = update
-                dlg = UpdateDialog(update["version"], update["body"], parent=window)
-                dlg.exec()
-            else:
-                logger.info("No update available")
+            if not _ui_alive(window):
+                return
+            worker = UpdateCheckWorker(window)
+            worker.found.connect(lambda update: _offer_update(window, update))
+            worker.start()
+            window._startup_update_worker = worker   # keep the QThread alive
 
         QTimer.singleShot(2000, check_update)
 

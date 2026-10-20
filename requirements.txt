@@ -1,19 +1,32 @@
 # AutoReport - pinned runtime dependencies
 #
-# Pinned to the versions this app was developed against, for Python 3.11/3.12
-# on Windows. The versions have NOT been re-resolved against current PyPI -
-# confirm the install works once, then treat that as your baseline.
+# Validated on Python 3.11 / 3.12 on Windows; build.bat prefers 3.12. Nothing
+# here needs a C compiler on those versions: every package ships a wheel.
 # After upgrading anything, regenerate on the build machine with:
-#     pip freeze > requirements.txt
+#     .venv\Scripts\python -m pip freeze > requirements.txt
 # and rebuild the release, so every colleague's auto-update lands on the
 # same set of library versions.
+#
+# Changes from the original pin set:
+#   - firebase-admin removed: the app no longer ships or uses a service
+#     account key. Data access goes through the Firestore REST API as the
+#     signed-in user (see report.py, "FIREBASE" section).
+#   - pyrebase removed: it only provided email/password sign-in, and it drags
+#     in the gcloud / oauth2client / pycryptodome / requests_toolbelt chain,
+#     which is the usual pip failure on Windows. Auth now calls the Identity
+#     Toolkit REST API directly.
+#   - pytz removed: replaced by the stdlib zoneinfo module.
+#   - tzdata added: Windows has no system tz database, so zoneinfo needs it.
+#   - Pillow is pinned per interpreter: 10.4.0 is the validated baseline, but
+#     it has no wheels past Python 3.12, where pip would otherwise try to
+#     compile it from source and fail on missing zlib headers. 12.3.0 is the
+#     first release with cp313/cp314/cp315 wheels.
 
 PyQt6==6.7.1
 requests==2.32.3
 beautifulsoup4==4.12.3
-Pillow==10.4.0
+Pillow==10.4.0; python_version < "3.13"
+Pillow==12.3.0; python_version >= "3.13"
 python-docx==1.1.2
 openpyxl==3.1.5
-pytz==2024.2
-pyrebase==3.0.27
-firebase-admin==6.5.0
+tzdata==2024.2

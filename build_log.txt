@@ -1,0 +1,209 @@
+==================================================================
+AutoReport build
+started: 2026-10-20 15:12:46
+log    : F:\Applications\Report\V3\build_log.txt
+==================================================================
+
+[1/9] Preconditions
+   syntax ok
+   build python : 3.15.0
+   executable   : C:\Users\Renedong\AppData\Local\Programs\Python\Python315\python.exe
+   platform     : Windows-11-10.0.26100-SP0
+   workdir      : F:\Applications\Report\V3
+   NOTE: 3.15.0 is newer than the validated 3.11/3.12 toolchain.
+         requirements.txt selects Pillow 12.3.0 here (10.4.0 has no
+         wheel past 3.12) and PyInstaller 6.22+ supports 3.15, so the
+         build continues - treat the resulting exe as untested and
+         smoke-test it. Installing 3.12 later gives the validated set.
+
+[2/9] Virtual environment
+   reusing existing .venv (Python 3.15)
+
+[3/9] pip, wheel, setuptools
+   $ F:\Applications\Report\V3\.venv\Scripts\python.exe -m pip install --upgrade pip wheel setuptools --disable-pip-version-check
+   Requirement already satisfied: pip in .\.venv\Lib\site-packages (26.2.1)
+   Requirement already satisfied: wheel in .\.venv\Lib\site-packages (0.48.0)
+   Requirement already satisfied: setuptools in .\.venv\Lib\site-packages (84.2.0)
+   Requirement already satisfied: packaging>=24.0 in .\.venv\Lib\site-packages (from wheel) (26.3)
+   -> exit 0 after 3.4s
+   $ F:\Applications\Report\V3\.venv\Scripts\python.exe -m pip --version
+   pip 26.2.1 from F:\Applications\Report\V3\.venv\Lib\site-packages\pip (python 3.15)
+
+   -> exit 0 after 1.1s
+
+[4/9] Runtime requirements
+   $ F:\Applications\Report\V3\.venv\Scripts\python.exe -m pip install -r F:\Applications\Report\V3\requirements.txt --only-binary :all: --disable-pip-version-check
+   Ignoring Pillow: markers 'python_version < "3.13"' don't match your environment
+   Requirement already satisfied: PyQt6==6.7.1 in .\.venv\Lib\site-packages (from -r F:\Applications\Report\V3\requirements.txt (line 25)) (6.7.1)
+   Requirement already satisfied: requests==2.32.3 in .\.venv\Lib\site-packages (from -r F:\Applications\Report\V3\requirements.txt (line 26)) (2.32.3)
+   Requirement already satisfied: beautifulsoup4==4.12.3 in .\.venv\Lib\site-packages (from -r F:\Applications\Report\V3\requirements.txt (line 27)) (4.12.3)
+   Requirement already satisfied: Pillow==12.3.0 in .\.venv\Lib\site-packages (from -r F:\Applications\Report\V3\requirements.txt (line 29)) (12.3.0)
+   Requirement already satisfied: python-docx==1.1.2 in .\.venv\Lib\site-packages (from -r F:\Applications\Report\V3\requirements.txt (line 30)) (1.1.2)
+   Requirement already satisfied: openpyxl==3.1.5 in .\.venv\Lib\site-packages (from -r F:\Applications\Report\V3\requirements.txt (line 31)) (3.1.5)
+   Requirement already satisfied: tzdata==2024.2 in .\.venv\Lib\site-packages (from -r F:\Applications\Report\V3\requirements.txt (line 32)) (2024.2)
+   Requirement already satisfied: PyQt6-sip<14,>=13.8 in .\.venv\Lib\site-packages (from PyQt6==6.7.1->-r F:\Applications\Report\V3\requirements.txt (line 25)) (13.13.0)
+   Requirement already satisfied: PyQt6-Qt6<6.8.0,>=6.7.0 in .\.venv\Lib\site-packages (from PyQt6==6.7.1->-r F:\Applications\Report\V3\requirements.txt (line 25)) (6.7.3)
+   Requirement already satisfied: charset-normalizer<4,>=2 in .\.venv\Lib\site-packages (from requests==2.32.3->-r F:\Applications\Report\V3\requirements.txt (line 26)) (3.5.2)
+   Requirement already satisfied: idna<4,>=2.5 in .\.venv\Lib\site-packages (from requests==2.32.3->-r F:\Applications\Report\V3\requirements.txt (line 26)) (3.20)
+   Requirement already satisfied: urllib3<3,>=1.21.1 in .\.venv\Lib\site-packages (from requests==2.32.3->-r F:\Applications\Report\V3\requirements.txt (line 26)) (2.8.0)
+   Requirement already satisfied: certifi>=2017.4.17 in .\.venv\Lib\site-packages (from requests==2.32.3->-r F:\Applications\Report\V3\requirements.txt (line 26)) (2026.10.19)
+   Requirement already satisfied: soupsieve>1.2 in .\.venv\Lib\site-packages (from beautifulsoup4==4.12.3->-r F:\Applications\Report\V3\requirements.txt (line 27)) (3.0.3)
+   Requirement already satisfied: lxml>=3.1.0 in .\.venv\Lib\site-packages (from python-docx==1.1.2->-r F:\Applications\Report\V3\requirements.txt (line 30)) (6.1.3)
+   Requirement already satisfied: typing-extensions>=4.9.0 in .\.venv\Lib\site-packages (from python-docx==1.1.2->-r F:\Applications\Report\V3\requirements.txt (line 30)) (4.16.0)
+   Requirement already satisfied: et-xmlfile in .\.venv\Lib\site-packages (from openpyxl==3.1.5->-r F:\Applications\Report\V3\requirements.txt (line 31)) (2.0.0)
+   -> exit 0 after 2.8s
+
+[5/9] Build requirements
+   $ F:\Applications\Report\V3\.venv\Scripts\python.exe -m pip install -r F:\Applications\Report\V3\requirements-build.txt --only-binary :all: --disable-pip-version-check
+   Requirement already satisfied: pyinstaller<7,>=6.6 in .\.venv\Lib\site-packages (from -r F:\Applications\Report\V3\requirements-build.txt (line 6)) (6.22.3)
+   Requirement already satisfied: altgraph in .\.venv\Lib\site-packages (from pyinstaller<7,>=6.6->-r F:\Applications\Report\V3\requirements-build.txt (line 6)) (0.17.5)
+   Requirement already satisfied: packaging>=22.0 in .\.venv\Lib\site-packages (from pyinstaller<7,>=6.6->-r F:\Applications\Report\V3\requirements-build.txt (line 6)) (26.3)
+   Requirement already satisfied: pefile>=2022.5.30 in .\.venv\Lib\site-packages (from pyinstaller<7,>=6.6->-r F:\Applications\Report\V3\requirements-build.txt (line 6)) (2024.8.26)
+   Requirement already satisfied: pyinstaller-hooks-contrib>=2026.7 in .\.venv\Lib\site-packages (from pyinstaller<7,>=6.6->-r F:\Applications\Report\V3\requirements-build.txt (line 6)) (2026.8)
+   Requirement already satisfied: pywin32-ctypes>=0.2.1 in .\.venv\Lib\site-packages (from pyinstaller<7,>=6.6->-r F:\Applications\Report\V3\requirements-build.txt (line 6)) (0.2.3)
+   Requirement already satisfied: setuptools>=42.0.0 in .\.venv\Lib\site-packages (from pyinstaller<7,>=6.6->-r F:\Applications\Report\V3\requirements-build.txt (line 6)) (84.2.0)
+   -> exit 0 after 2.7s
+
+[6/9] Import and syntax checks
+   $ F:\Applications\Report\V3\.venv\Scripts\python.exe -m py_compile F:\Applications\Report\V3\report.py
+   -> exit 0 after 0.7s
+   $ F:\Applications\Report\V3\.venv\Scripts\python.exe -c "import report; from zoneinfo import ZoneInfo; ZoneInfo('Asia/Kuala_Lumpur'); print('report imports ok')"
+   report imports ok
+   -> exit 0 after 2.4s
+
+[7/9] Freeze into dist/Report.exe
+   removing F:\Applications\Report\V3\build
+   removing F:\Applications\Report\V3\dist
+   $ F:\Applications\Report\V3\.venv\Scripts\python.exe -m PyInstaller --noconfirm --onefile --windowed --name Report --icon F:\Applications\Report\V3\asset\app.ico --collect-data tzdata --exclude-module tkinter --exclude-module numpy --exclude-module pandas --exclude-module matplotlib --exclude-module scipy --exclude-module IPython --specpath F:\Applications\Report\V3\build --workpath F:\Applications\Report\V3\build --distpath F:\Applications\Report\V3\dist F:\Applications\Report\V3\report.py
+   512 INFO: PyInstaller: 6.22.3, contrib hooks: 2026.8
+   514 INFO: Python: 3.15.0
+   645 INFO: Platform: Windows-11-10.0.26100-SP0
+   645 INFO: Python environment: F:\Applications\Report\V3\.venv
+   646 INFO: wrote F:\Applications\Report\V3\build\Report.spec
+   982 INFO: Module search paths (PYTHONPATH):
+   ['F:\\Applications\\Report\\V3',
+    'C:\\Users\\Renedong\\AppData\\Local\\Programs\\Python\\Python315\\python315.zip',
+    'C:\\Users\\Renedong\\AppData\\Local\\Programs\\Python\\Python315\\DLLs',
+    'C:\\Users\\Renedong\\AppData\\Local\\Programs\\Python\\Python315\\Lib',
+    'C:\\Users\\Renedong\\AppData\\Local\\Programs\\Python\\Python315',
+    'F:\\Applications\\Report\\V3\\.venv',
+    'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages',
+    'F:\\Applications\\Report\\V3']
+   1716 INFO: Appending 'datas' from .spec
+   1750 INFO: checking Analysis
+   1750 INFO: Building Analysis because Analysis-00.toc is non existent
+   1750 INFO: Looking for Python shared library...
+   1750 INFO: Using Python shared library: C:\Users\Renedong\AppData\Local\Programs\Python\Python315\python315.dll
+   1750 INFO: Running Analysis Analysis-00.toc
+   1750 INFO: Target bytecode optimization level: 0
+   1750 INFO: Initializing module dependency graph...
+   1752 INFO: Initializing module graph hook caches...
+   1781 INFO: Analyzing modules for base_library.zip ...
+   4633 INFO: Processing standard module hook 'hook-heapq.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   5500 INFO: Processing standard module hook 'hook-encodings.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   7191 INFO: Processing standard module hook 'hook-math.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   10806 INFO: Processing standard module hook 'hook-difflib.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   11168 INFO: Processing standard module hook 'hook-pickle.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   12973 INFO: Caching module dependency graph...
+   13024 INFO: Analyzing F:\Applications\Report\V3\report.py
+   13421 INFO: Processing standard module hook 'hook-sysconfig.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   13431 INFO: Processing standard module hook 'hook-_ctypes.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   13642 INFO: Processing standard module hook 'hook-zoneinfo.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+   13799 INFO: Processing standard module hook 'hook-urllib3.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+   14058 INFO: Processing pre-safe-import-module hook 'hook-backports.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+   14060 INFO: SetuptoolsInfo: initializing cached setuptools info...
+   14862 INFO: Setuptools: 'backports' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._vendor.backports'!
+   14872 INFO: Processing standard module hook 'hook-setuptools.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   14946 INFO: Processing standard module hook 'hook-platform.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   14949 INFO: Processing pre-safe-import-module hook 'hook-distutils.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+   15000 INFO: Processing pre-safe-import-module hook 'hook-jaraco.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+   15000 INFO: Setuptools: 'jaraco' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._vendor.jaraco'!
+   15019 INFO: Processing pre-safe-import-module hook 'hook-more_itertools.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+   15019 INFO: Setuptools: 'more_itertools' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.more_itertools'!
+   15313 INFO: Processing standard module hook 'hook-_osx_support.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   15319 INFO: Processing pre-safe-import-module hook 'hook-typing_extensions.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+   15798 INFO: Processing standard module hook 'hook-multiprocessing.util.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   16090 INFO: Processing standard module hook 'hook-xml.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   17237 INFO: Processing pre-safe-import-module hook 'hook-packaging.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+   17747 INFO: Processing standard module hook 'hook-setuptools._vendor.jaraco.text.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   17749 INFO: Processing pre-safe-import-module hook 'hook-importlib_resources.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+   18734 INFO: Processing pre-safe-import-module hook 'hook-tomli.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+   18735 INFO: Setuptools: 'tomli' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.tomli'!
+   19898 INFO: Processing pre-safe-import-module hook 'hook-wheel.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+   20474 INFO: Processing standard module hook 'hook-charset_normalizer.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+   20949 INFO: Processing standard module hook 'hook-certifi.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+   21835 INFO: Processing standard module hook 'hook-lxml.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+   22346 INFO: Processing standard module hook 'hook-lxml.etree.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+   22352 INFO: Processing standard module hook 'hook-PIL.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   22565 INFO: Processing standard module hook 'hook-PIL.Image.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   23246 INFO: Processing standard module hook 'hook-xml.etree.cElementTree.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   23587 INFO: Processing standard module hook 'hook-PIL.ImageFilter.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   24055 INFO: Processing standard module hook 'hook-docx.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+   25106 INFO: Processing standard module hook 'hook-PyQt6.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   27200 INFO: Processing standard module hook 'hook-PyQt6.QtWidgets.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   33046 INFO: Processing standard module hook 'hook-PyQt6.QtCore.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   39475 INFO: Processing standard module hook 'hook-PyQt6.QtGui.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   65700 INFO: Processing standard module hook 'hook-openpyxl.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+   67321 INFO: Processing module hooks (post-graph stage)...
+   68319 INFO: Processing standard module hook 'hook-webbrowser.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   69639 INFO: Processing standard module hook 'hook-lxml.isoschematron.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+   70323 INFO: Processing standard module hook 'hook-PIL.SpiderImagePlugin.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   70570 INFO: Processing standard module hook 'hook-lxml.objectify.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+   70571 INFO: Processing standard module hook 'hook-tzdata.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+   71290 INFO: Performing binary vs. data reclassification (749 entries)
+   71392 INFO: Looking for ctypes DLLs
+   71556 INFO: Analyzing run-time hooks ...
+   71569 INFO: Including run-time hook 'pyi_rth_inspect.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+   71575 INFO: Including run-time hook 'pyi_rth_pkgutil.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+   71578 INFO: Including run-time hook 'pyi_rth_multiprocessing.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+   71586 INFO: Including run-time hook 'pyi_rth_pyqt6.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+   71589 INFO: Processing pre-find-module-path hook 'hook-_pyi_rth_utils.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_find_module_path'
+   71591 INFO: Processing standard module hook 'hook-_pyi_rth_utils.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+   71599 INFO: Including run-time hook 'pyi_rth_setuptools.py' from 'F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+   71641 INFO: Creating base_library.zip...
+   71675 INFO: Looking for dynamic libraries
+   72902 INFO: Extra DLL search directories (AddDllDirectory): ['F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyQt6\\Qt6\\bin']
+   72902 INFO: Extra DLL search directories (PATH): ['F:\\Applications\\Report\\V3\\.venv\\Lib\\site-packages\\PyQt6\\Qt6\\bin']
+   74112 INFO: Warnings written to F:\Applications\Report\V3\build\Report\warn-Report.txt
+   74210 INFO: Graph cross-reference written to F:\Applications\Report\V3\build\Report\xref-Report.html
+   74291 INFO: checking PYZ
+   74291 INFO: Building PYZ because PYZ-00.toc is non existent
+   74291 INFO: Building PYZ (ZlibArchive) F:\Applications\Report\V3\build\Report\PYZ-00.pyz
+   74915 INFO: Building PYZ (ZlibArchive) F:\Applications\Report\V3\build\Report\PYZ-00.pyz completed successfully.
+   74955 INFO: checking PKG
+   74956 INFO: Building PKG because PKG-00.toc is non existent
+   74956 INFO: Building PKG (CArchive) Report.pkg
+   81921 INFO: Building PKG (CArchive) Report.pkg completed successfully.
+   81943 INFO: Bootloader F:\Applications\Report\V3\.venv\Lib\site-packages\PyInstaller\bootloader\Windows-64bit-intel\runw.exe
+   81943 INFO: checking EXE
+   81943 INFO: Building EXE because EXE-00.toc is non existent
+   81943 INFO: Building EXE from EXE-00.toc
+   81943 INFO: Copying bootloader EXE to F:\Applications\Report\V3\dist\Report.exe
+   81947 INFO: Copying icon to EXE
+   81953 INFO: Copying 0 resources to EXE
+   81953 INFO: Embedding manifest in EXE
+   81957 INFO: Appending PKG archive to EXE
+   82014 INFO: Fixing EXE headers
+   82521 INFO: Building EXE from EXE-00.toc completed successfully.
+   82545 INFO: Build complete! The results are available in: F:\Applications\Report\V3\dist
+   -> exit 0 after 83.5s
+   built F:\Applications\Report\V3\dist\Report.exe (49.7 MB)
+
+[8/9] Copy templates and assets
+   copied Report Template.docx
+   copied POT_Template.docx
+   copied asset\
+
+[9/9] Package release zip
+   AutoReport-release.zip: 49.5 MB, 8 file(s)
+
+==================================================================
+DONE
+  application : F:\Applications\Report\V3\dist\Report.exe
+  release zip : F:\Applications\Report\V3\AutoReport-release.zip
+  log         : F:\Applications\Report\V3\build_log.txt
+
+Smoke test before shipping:
+  start the exe, sign in, generate one status report and one POT,
+  and confirm Reports\MM-DD-YYYY\ appears next to the exe.
+==================================================================

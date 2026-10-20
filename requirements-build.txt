@@ -1,0 +1,6 @@
+# AutoReport - build-only dependencies
+#
+# Installed by build.bat into .venv. Keep this out of the runtime freeze:
+# PyInstaller must never be bundled into Report.exe.
+
+pyinstaller>=6.6,<7
