@@ -1,0 +1,22 @@
+# Firebase Admin credential - full read/write on the Firestore database.
+# Never commit this file; rotate the key if it ever lands in git history.
+serviceAccountKey.json
+
+# Runtime output
+report_log.txt
+
+# Updater working files: _prev/ holds a copy of the previous build
+_update_swap.bat
+_update_trial.json
+_update_started.flag
+_update_ok.flag
+_update_failed.txt
+_prev/
+*.new
+[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9]/
+
+# Build artifacts
+build/
+dist/
+*.spec
+update_extract/

@@ -1,5 +1,10 @@
 import sys
 import os
+import re
+import json
+import time
+import shutil
+import tempfile
 import winreg
 import ctypes
 import logging
@@ -47,6 +52,20 @@ logger = logging.getLogger("report")
 org_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection/WebPOS"
 collection_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection"
 template_path = "Report Template.docx"
+
+# ================= HTTP TIME-OUTS =================
+# requests has no default timeout, so without these a stalled connection
+# blocks a worker thread forever: no error, no cancel, no result.
+HTTP_TIMEOUT = 30      # TFS / Azure DevOps REST calls
+IMAGE_TIMEOUT = 20     # images embedded in a work item comment
+DOWNLOAD_TIMEOUT = 120 # release assets: bigger, slower, worth waiting for
+
+# Update bookkeeping, all inside the app directory.
+UPDATE_PREV_DIR = "_prev"              # one generation back, for rollback
+UPDATE_TRIAL_FILE = "_update_trial.json"    # written before the restart
+UPDATE_STARTED_FILE = "_update_started.flag"  # written by the first start after it
+UPDATE_OK_FILE = "_update_ok.flag"       # written once a window is up
+UPDATE_FAILED_FILE = "_update_failed.txt"  # written by the swap script
 
 # ================= AUTO-UPDATE CONFIG =================
 APP_VERSION = "3.0.8.5"
@@ -232,103 +251,328 @@ def _check_for_update():
 
         logger.info("Latest release: %s (current: %s)", tag, APP_VERSION)
 
-        # Simple version comparison: split on '.' and compare as ints
+        # Version comparison on the leading numeric part only. A tag like
+        # "v3.1.0-beta" used to raise ValueError, fall back to [0], and compare
+        # as "older" - which silently disabled updates for any prerelease tag.
         def parse_ver(v):
-            try:
-                return [int(x) for x in v.split(".")]
-            except ValueError:
-                return [0]
+            match = re.match(r"(\d+(?:\.\d+)*)", (v or "").strip())
+            return [int(p) for p in match.group(1).split(".")] if match else [0]
 
         if parse_ver(tag) <= parse_ver(APP_VERSION):
             logger.info("Already up-to-date")
             return None
 
-        # Find the first .zip asset (preferred) or .exe asset
+        # Prefer a .zip (extracted in place), fall back to an .exe installer.
+        # Whatever is picked, carry its advertised size and digest through:
+        # they are the only way to tell a good download from a truncated one.
         assets = data.get("assets", [])
-        download_url = None
-        asset_type = None
-        for asset in assets:
-            name = asset.get("name", "")
-            if name.endswith(".zip"):
-                download_url = asset.get("browser_download_url")
-                asset_type = "zip"
-                break
-        if not download_url:
+        chosen = None
+        for wanted in (".zip", ".exe"):
             for asset in assets:
-                name = asset.get("name", "")
-                if name.endswith(".exe"):
-                    download_url = asset.get("browser_download_url")
-                    asset_type = "exe"
+                if asset.get("name", "").lower().endswith(wanted):
+                    chosen = asset
                     break
+            if chosen:
+                break
 
-        if not download_url:
+        if not chosen:
             logger.warning("No .zip or .exe asset found in release %s", tag)
             return None
 
+        download_url = chosen.get("browser_download_url")
+        if not download_url:
+            logger.warning("Asset %r has no download URL", chosen.get("name"))
+            return None
+
+        asset_type = "zip" if chosen.get("name", "").lower().endswith(".zip") else "exe"
         logger.info("Update asset found: type=%s, url=%s", asset_type, download_url[:80])
+        logger.info("Update asset metadata: size=%r digest=%r",
+                    chosen.get("size"), chosen.get("digest"))
         return {
             "version": tag,
             "download_url": download_url,
             "asset_type": asset_type,
             "body": data.get("body", ""),
+            "size": chosen.get("size") or None,
+            "digest": chosen.get("digest") or None,
         }
     except Exception:
         logger.exception("Update check failed")
         return None
 
 
-def _download_update(download_url, progress_callback=None):
+def _download_update(download_url, progress_callback=None,
+                     expected_size=None, expected_digest=None, attempts=3):
     """
-    Download the update file to a temp location. Returns the file path or None.
-    progress_callback(bytes_downloaded, total_bytes) is called periodically.
+    Download an update and verify it before returning the path.
+
+    Retries transient failures, writes to a .part file so an interrupted
+    download can never be mistaken for a finished one, and checks the size and
+    SHA-256 the release advertises. Returns the path, or None on failure.
     """
-    import tempfile
-    logger.info("Downloading update from %s", download_url)
+    import hashlib
+
+    filename = download_url.split("/")[-1].split("?")[0] or "update.zip"
+    tmp_path = os.path.join(tempfile.gettempdir(), filename)
+    part_path = tmp_path + ".part"
+
+    for attempt in range(1, attempts + 1):
+        logger.info("Downloading update (attempt %d/%d): %s", attempt, attempts, download_url)
+        try:
+            digest = hashlib.sha256()
+            downloaded = 0
+            with requests.get(download_url, stream=True, timeout=DOWNLOAD_TIMEOUT) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("content-length", 0))
+                with open(part_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        digest.update(chunk)
+                        downloaded += len(chunk)
+                        if progress_callback and total:
+                            progress_callback(downloaded, total)
+
+            # A truncated download is still a valid .zip prefix far less often
+            # than it is a corrupt one, so check both claims the release makes.
+            if expected_size and downloaded != int(expected_size):
+                raise ValueError(
+                    f"size mismatch: got {downloaded} bytes, expected {expected_size}"
+                )
+            if expected_digest:
+                expected_hex = str(expected_digest).split(":", 1)[-1].strip().lower()
+                if digest.hexdigest() != expected_hex:
+                    raise ValueError("SHA-256 mismatch - the download is corrupt or tampered with")
+
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            os.replace(part_path, tmp_path)
+            logger.info("Update downloaded to %s (%d bytes, sha256=%s)",
+                        tmp_path, downloaded, digest.hexdigest())
+            return tmp_path
+
+        except Exception as e:
+            logger.exception("Download attempt %d failed: %s", attempt, e)
+            try:
+                if os.path.exists(part_path):
+                    os.remove(part_path)
+            except OSError:
+                logger.warning("Could not remove partial download: %s", part_path)
+            if attempt >= attempts:
+                return None
+            time.sleep(2 * attempt)
+
+    return None
+
+
+def _app_dir():
+    """Directory the app runs from, whether frozen or run from source."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _clear_update_markers(app_dir):
+    """
+    Forget the in-flight update markers. The _prev/ backup is kept, and so is
+    _update_failed.txt: _cleanup_update_artifacts still has to read and log it.
+    """
+    for name in (UPDATE_TRIAL_FILE, UPDATE_STARTED_FILE, UPDATE_OK_FILE):
+        try:
+            os.remove(os.path.join(app_dir, name))
+        except OSError:
+            pass
+
+
+def _mark_update_ok():
+    """
+    Called once a window is actually on screen. Clearing the markers here is
+    what tells the next start that the applied update is usable.
+    """
+    app_dir = _app_dir()
+    trial_path = os.path.join(app_dir, UPDATE_TRIAL_FILE)
+    if not os.path.isfile(trial_path):
+        return
+
     try:
-        resp = requests.get(download_url, stream=True, timeout=60)
-        resp.raise_for_status()
-        total = int(resp.headers.get("content-length", 0))
-        downloaded = 0
+        os.remove(trial_path)
+        _clear_update_markers(app_dir)
+        logger.info("Update confirmed working - trial markers cleared")
+        return
+    except OSError:
+        pass
 
-        tmp_dir = tempfile.gettempdir()
-        filename = download_url.split("/")[-1].split("?")[0]
-        tmp_path = os.path.join(tmp_dir, filename)
-
-        with open(tmp_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if progress_callback and total:
-                    progress_callback(downloaded, total)
-
-        logger.info("Update downloaded to %s (%d bytes)", tmp_path, downloaded)
-        return tmp_path
-    except Exception:
-        logger.exception("Failed to download update")
-        return None
+    # Could not remove it. Leave a flag recording that a window really did
+    # appear, so the next start does not roll a working build back.
+    try:
+        with open(os.path.join(app_dir, UPDATE_OK_FILE), "w", encoding="utf-8") as f:
+            f.write(datetime.now().isoformat())
+        logger.warning("Could not clear the update trial marker - wrote %s instead",
+                       UPDATE_OK_FILE)
+    except OSError:
+        logger.warning("Could not write the update confirmation flag")
 
 
-def _apply_zip_update(zip_path):
+def _restore_from_backup(prev_dir, app_dir, names):
+    """
+    Copy backed-up originals back over whatever an update already replaced.
+    Best effort: anything still locked is skipped and logged.
+    """
+    restored = 0
+    for name in names:
+        src = os.path.join(prev_dir, name)
+        dst = os.path.join(app_dir, name)
+        if not os.path.exists(src):
+            continue
+        try:
+            if os.path.isdir(src):
+                if os.path.exists(dst):
+                    shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+            restored += 1
+            logger.info("Rolled back: %s", name)
+        except Exception:
+            logger.exception("Rollback failed for %s - restore it from %s", name, prev_dir)
+    return restored
+
+
+def _restore_previous_version(app_dir):
+    """
+    Put the files saved in _prev/ back in place. Anything still locked - the
+    running exe - is staged as .new and swapped in by the batch script after
+    this process exits, which is the same mechanism a normal update uses.
+
+    Returns the number of items handled.
+    """
+    prev_dir = os.path.join(app_dir, UPDATE_PREV_DIR)
+    if not os.path.isdir(prev_dir):
+        return 0
+
+    handled = 0
+    locked = []
+    for name in os.listdir(prev_dir):
+        src = os.path.join(prev_dir, name)
+        dst = os.path.join(app_dir, name)
+        try:
+            if os.path.isdir(src):
+                if os.path.exists(dst):
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+            handled += 1
+        except PermissionError:
+            staged = dst + ".new"
+            try:
+                if os.path.isdir(src):
+                    if os.path.exists(staged):
+                        shutil.rmtree(staged)
+                    shutil.copytree(src, staged)
+                else:
+                    if os.path.exists(staged):
+                        os.remove(staged)
+                    shutil.copy2(src, staged)
+                locked.append((staged, dst))
+                handled += 1
+            except Exception:
+                logger.exception("Could not stage rollback for %s", dst)
+        except Exception:
+            logger.exception("Could not roll back %s", name)
+
+    if locked:
+        exe_name = os.path.basename(sys.executable) if getattr(sys, 'frozen', False) else None
+        _write_swap_script(os.path.join(app_dir, "_update_swap.bat"), app_dir, exe_name, locked)
+    return handled
+
+
+def _recover_failed_update():
+    """
+    Run once at startup, before the UI is built.
+
+    An update writes a trial marker before restarting. If the next launch never
+    reaches a visible window, the marker is still there - which means the new
+    build is broken. The previous version is restored and the app relaunches
+    into it. Returns True when a relaunch is pending (the caller must exit).
+    """
+    app_dir = _app_dir()
+    trial_path = os.path.join(app_dir, UPDATE_TRIAL_FILE)
+    started_path = os.path.join(app_dir, UPDATE_STARTED_FILE)
+
+    if not os.path.isfile(trial_path):
+        # Nothing pending. Drop any stray markers from an interrupted run.
+        _clear_update_markers(app_dir)
+        return False
+
+    # A window has already been on screen for this build - nothing to recover.
+    if os.path.isfile(os.path.join(app_dir, UPDATE_OK_FILE)):
+        _clear_update_markers(app_dir)
+        return False
+
+    # First start of the updated build. Record that it got this far and let it
+    # run: the marker written here is what the NEXT start looks for. Without
+    # this phase every successful update would be rolled back immediately,
+    # because the trial marker is written before the restart, not after it.
+    if not os.path.isfile(started_path):
+        try:
+            with open(started_path, "w", encoding="utf-8") as f:
+                f.write(datetime.now().isoformat())
+            logger.info("First start after an update - watching this build")
+        except OSError:
+            logger.warning("Could not write the update start marker")
+        return False
+
+    if not os.path.isdir(os.path.join(app_dir, UPDATE_PREV_DIR)):
+        logger.warning("Update trial marker found, but there is no backup to restore")
+        _clear_update_markers(app_dir)
+        return False
+
+    logger.error("The updated build never reached a window - restoring the previous version")
+    handled = _restore_previous_version(app_dir)
+
+    # Clear the marker *before* relaunching: if the restored build also fails,
+    # the next start must not roll back again, or it would loop forever.
+    _clear_update_markers(app_dir)
+
+    if handled == 0:
+        logger.error("Nothing could be restored from %s", UPDATE_PREV_DIR)
+        return False
+
+    bat_path = os.path.join(app_dir, "_update_swap.bat")
+    if not os.path.isfile(bat_path):
+        # Nothing was locked, so the files are already restored in place.
+        logger.info("Rolled back %d item(s) without a relaunch script", handled)
+        return False
+
+    logger.info("Rolled back %d item(s); the relaunch script will start the restored build", handled)
+    return True
+
+
+def _apply_zip_update(zip_path, version=""):
     """
     Extract a zip update and replace files in the current app directory.
-    Locked files (e.g. the running exe) are staged as .new and swapped
-    by a batch script after the app exits.
-    Returns True on success, False on failure.
+
+    Order is deliberate: validate the payload, back up everything it will
+    touch, and only then replace anything. A failure at any point restores the
+    backup, so a bad update leaves the old install exactly as it was instead of
+    half old and half new.
+
+    Locked files (the running exe) are staged as .new and swapped by a batch
+    script after the app exits. Returns (ok, message).
     """
     import zipfile
-    import shutil
 
-    if getattr(sys, 'frozen', False):
-        app_dir = os.path.dirname(sys.executable)
-        exe_name = os.path.basename(sys.executable)
-    else:
-        app_dir = os.path.dirname(os.path.abspath(__file__))
-        exe_name = None
+    app_dir = _app_dir()
+    exe_name = os.path.basename(sys.executable) if getattr(sys, 'frozen', False) else None
 
     logger.info("Applying zip update: %s -> %s", zip_path, app_dir)
 
+    extract_dir = os.path.join(tempfile.gettempdir(), "update_extract")
+    prev_dir = os.path.join(app_dir, UPDATE_PREV_DIR)
+
     try:
-        extract_dir = os.path.join(os.path.dirname(zip_path), "update_extract")
         if os.path.exists(extract_dir):
             shutil.rmtree(extract_dir)
         os.makedirs(extract_dir)
@@ -341,7 +585,7 @@ def _apply_zip_update(zip_path):
                 if member_real != root_real and not member_real.startswith(root_real + os.sep):
                     logger.error("Rejecting unsafe zip member: %r", name)
                     shutil.rmtree(extract_dir, ignore_errors=True)
-                    return False
+                    return False, "The update archive contains an unsafe path and was rejected."
             zf.extractall(extract_dir)
             logger.info("Extracted %d member(s) from zip", len(members))
 
@@ -354,6 +598,45 @@ def _apply_zip_update(zip_path):
             entries = os.listdir(payload_dir)
         logger.info("Update payload root: %s (%d top-level item(s))", payload_dir, len(entries))
 
+        # Refuse a payload that clearly isn't this app. An empty or wrong zip
+        # used to "apply" successfully and restart into the same version.
+        anchor = exe_name or "report.py"
+        if not entries or anchor not in entries:
+            logger.error("Update payload has no %r - refusing to apply", anchor)
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            return False, (
+                f"The update archive does not contain {anchor}, so it was not "
+                "applied. The current installation is unchanged."
+            )
+
+        # --- Back up everything the payload will overwrite ---
+        # Start from an empty backup dir so it only ever holds the generation
+        # immediately before this one: a stale entry from an older round would
+        # otherwise be restored over a newer file.
+        if os.path.isdir(prev_dir):
+            shutil.rmtree(prev_dir, ignore_errors=True)
+        os.makedirs(prev_dir, exist_ok=True)
+        for item in entries:
+            dst = os.path.join(app_dir, item)
+            if not os.path.exists(dst):
+                continue
+            backup = os.path.join(prev_dir, item)
+            try:
+                if os.path.isdir(dst):
+                    if os.path.exists(backup):
+                        shutil.rmtree(backup)
+                    shutil.copytree(dst, backup)
+                else:
+                    shutil.copy2(dst, backup)
+            except Exception as e:
+                logger.exception("Backup failed for %s - aborting before any change", item)
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                return False, (
+                    f"Could not back up {item} before updating ({e}). "
+                    "Nothing was changed."
+                )
+
+        # --- Replace ---
         copied = 0
         locked_files = []
         for item in entries:
@@ -372,17 +655,32 @@ def _apply_zip_update(zip_path):
                 # File is locked (most likely the running exe) - stage as .new
                 staged = dst + ".new"
                 try:
-                    if os.path.exists(staged):
+                    if os.path.isdir(staged):
+                        shutil.rmtree(staged)
+                    elif os.path.exists(staged):
                         os.remove(staged)
                 except OSError:
                     logger.warning("Could not remove stale .new file: %s", staged)
                 try:
-                    shutil.copy2(src_item, staged)
+                    if os.path.isdir(src_item):
+                        shutil.copytree(src_item, staged)
+                    else:
+                        shutil.copy2(src_item, staged)
                     locked_files.append((staged, dst))
                     copied += 1
                     logger.info("Staged locked file: %s -> %s", src_item, staged)
                 except Exception:
                     logger.exception("Failed to stage locked file: %s -> %s", src_item, staged)
+                    raise
+            except Exception:
+                # Anything unexpected part-way through: put the originals back.
+                logger.exception("Update failed while replacing %s - rolling back", item)
+                restored = _restore_from_backup(prev_dir, app_dir, entries)
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                return False, (
+                    f"Updating failed while replacing {item}. "
+                    f"Restored {restored} item(s) from the previous version."
+                )
 
         # Re-stage any .new file left over from an earlier attempt so the
         # swap script retries it instead of leaving it behind forever.
@@ -398,6 +696,19 @@ def _apply_zip_update(zip_path):
             logger.info("Created update swap script for %d locked file(s): %s",
                         len(locked_files), bat_path)
 
+        # Trial marker: the next start has to reach a visible window, otherwise
+        # _recover_failed_update() puts the previous version back.
+        try:
+            with open(os.path.join(app_dir, UPDATE_TRIAL_FILE), "w", encoding="utf-8") as f:
+                json.dump({"version": version, "at": datetime.now().isoformat()}, f)
+        except OSError:
+            logger.warning("Could not write the update trial marker")
+
+        try:
+            os.remove(os.path.join(app_dir, UPDATE_FAILED_FILE))
+        except OSError:
+            pass
+
         shutil.rmtree(extract_dir, ignore_errors=True)
         try:
             os.remove(zip_path)
@@ -405,11 +716,16 @@ def _apply_zip_update(zip_path):
             logger.warning("Could not remove downloaded update: %s", zip_path)
         logger.info("Zip update applied: %d item(s) processed, %d locked",
                     copied, len(locked_files))
-        return True
+        return True, ""
 
-    except Exception:
+    except Exception as e:
         logger.exception("Failed to apply zip update")
-        return False
+        restored = 0
+        if os.path.isdir(prev_dir):
+            restored = _restore_from_backup(prev_dir, app_dir, os.listdir(prev_dir))
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        return False, f"The update could not be applied ({e}). Restored {restored} item(s) from _prev."
+
 
 
 def _bat_quote(path):
@@ -470,10 +786,15 @@ def _write_swap_script(bat_path, app_dir, exe_name, locked_files):
         "rem --- give the OS a moment to release file handles ---",
         '"%s" -n 3 127.0.0.1 >nul' % ping,
     ]
+    failed_path = os.path.join(app_dir, UPDATE_FAILED_FILE)
+
     for staged, dst in locked_files:
         lines.append('call :replace %s %s' % (_bat_quote(staged), _bat_quote(dst)))
     lines += [
         "",
+        # The app is relaunched even when a replace failed: a missing window is
+        # worse than an update that did not take. The failure is recorded in
+        # _update_failed.txt, which the next start reads and logs.
         'start "" /d %s %s' % (_bat_quote(app_dir), _bat_quote(target)),
         "exit /b 0",
         "",
@@ -484,9 +805,12 @@ def _write_swap_script(bat_path, app_dir, exe_name, locked_files):
         'move /y "%~1" "%~2" >nul 2>&1',
         'if not exist "%~1" exit /b 0',
         "set /a _rtries=%_rtries%+1",
-        "if %_rtries% geq 20 exit /b 1",
+        "if %_rtries% geq 20 goto replace_giveup",
         '"%s" -n 2 127.0.0.1 >nul' % ping,
         "goto replace_loop",
+        ":replace_giveup",
+        'echo "%~2">> %s' % _bat_quote(failed_path),
+        "exit /b 1",
     ]
 
     data = "\r\n".join(lines) + "\r\n"
@@ -599,6 +923,62 @@ def replace_placeholders_in_doc(doc, replacements: dict):
     logger.debug("Processed %d text box(es) in document", txbx_count)
 
 
+def insert_html_into_placeholder(doc, placeholder, raw_html, pat=""):
+    """
+    Replace `placeholder` with rendered HTML (images included) wherever it
+    lives: body paragraphs, table cells (nested tables too) or text boxes.
+    Returns True when the placeholder was found and replaced.
+    """
+    logger.info("Looking for placeholder %r in document", placeholder)
+    found = False
+
+    def try_paragraph(paragraph):
+        nonlocal found
+        if placeholder in paragraph.text:
+            logger.debug("Found %r in paragraph text", placeholder)
+            for run in paragraph.runs:
+                run.text = ""
+            add_html_content_to_paragraph(paragraph, raw_html, pat)
+            found = True
+            return True
+        return False
+
+    # Body paragraphs
+    for para in doc.paragraphs:
+        if try_paragraph(para):
+            return True
+
+    # Table cells, including tables nested inside a cell
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    if try_paragraph(para):
+                        return True
+                for nested_table in cell.tables:
+                    for nrow in nested_table.rows:
+                        for ncell in nrow.cells:
+                            for npara in ncell.paragraphs:
+                                if try_paragraph(npara):
+                                    return True
+
+    # Text boxes live inside drawing/VML shapes, which doc.paragraphs and
+    # doc.tables never expose, so walk the raw XML tree.
+    from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph
+
+    for txbx_content in doc.element.body.iter(qn('w:txbxContent')):
+        for p in txbx_content.iter(qn('w:p')):
+            if try_paragraph(Paragraph(p, None)):
+                return True
+
+    logger.warning(
+        "Placeholder %r was NOT FOUND in any paragraph, table cell, or text box!",
+        placeholder,
+    )
+    return False
+
+
 def add_html_content_to_paragraph(paragraph, html_content, pat=""):
     """Render HTML content (with images) into a Word paragraph."""
     logger.debug("Rendering HTML content into paragraph (length=%d chars)", len(html_content))
@@ -629,7 +1009,7 @@ def add_html_content_to_paragraph(paragraph, html_content, pat=""):
                 if img_url:
                     try:
                         logger.debug("Fetching image: %s", img_url[:120])
-                        img_resp = requests.get(img_url, auth=HTTPBasicAuth("", pat))
+                        img_resp = requests.get(img_url, auth=HTTPBasicAuth("", pat), timeout=IMAGE_TIMEOUT)
                         img_resp.raise_for_status()
                         image_stream = BytesIO(img_resp.content)
                         image = Image.open(image_stream)
@@ -722,6 +1102,21 @@ class AppDialog(QtWidgets.QDialog):
         layout.addWidget(label)
         layout.addStretch()
         layout.addWidget(button)
+
+
+class UpdateCheckWorker(QThread):
+    """
+    Runs the GitHub release check off the GUI thread, so the Settings button
+    cannot freeze the window while the request is in flight.
+    """
+    found = pyqtSignal(object)   # update dict, or None when up to date
+
+    def run(self):
+        try:
+            self.found.emit(_check_for_update())
+        except Exception:
+            logger.exception("Manual update check failed")
+            self.found.emit(None)
 
 
 class UpdateDialog(QtWidgets.QDialog):
@@ -859,9 +1254,17 @@ class UpdateDialog(QtWidgets.QDialog):
         url = update_info["download_url"]
         asset_type = update_info.get("asset_type", "exe")
 
-        path = _download_update(url, progress_callback=on_progress)
+        path = _download_update(
+            url,
+            progress_callback=on_progress,
+            expected_size=update_info.get("size"),
+            expected_digest=update_info.get("digest"),
+        )
         if not path:
-            self.status_label.setText("Download failed. Check logs.")
+            self.status_label.setText(
+                "Download failed after 3 attempts. Nothing was installed; "
+                "the details are in report_log.txt."
+            )
             self.download_btn.setEnabled(True)
             self.download_btn.setText("Retry")
             self.download_btn.clicked.disconnect()
@@ -872,17 +1275,19 @@ class UpdateDialog(QtWidgets.QDialog):
 
         if asset_type == "zip":
             # Extract and replace files in-place
-            self.status_label.setText("Extracting update...")
+            self.status_label.setText("Verifying and installing update...")
             self.download_btn.setText("Applying update...")
             QtWidgets.QApplication.processEvents()
 
-            if _apply_zip_update(path):
+            ok, message = _apply_zip_update(path, update_info.get("version", ""))
+            if ok:
                 self.status_label.setText("Update applied! Restarting app...")
                 QtWidgets.QApplication.processEvents()
                 logger.info("Zip update applied, restarting app")
                 self._restart_app()
             else:
-                self.status_label.setText("Failed to apply update. Check logs.")
+                # Say what actually went wrong: the old build is still intact.
+                self.status_label.setText(message or "Failed to apply update.")
                 self.download_btn.setText("Close")
                 self.download_btn.setEnabled(True)
                 self.download_btn.clicked.connect(self.accept)
@@ -916,11 +1321,13 @@ class UpdateDialog(QtWidgets.QDialog):
 
         bat_path = os.path.join(app_dir, "_update_swap.bat")
 
-        # Nothing was locked in this update, so no swap script exists yet. Write
-        # a relaunch-only one anyway: starting the new copy while this process
-        # still holds the single-instance mutex would make it refuse to start
-        # and leave the user with no window at all.
-        if not os.path.isfile(bat_path) and exe_name:
+        # Write a relaunch-only script if the update did not create one.
+        # Starting the new copy while this process still holds the
+        # single-instance mutex would make it refuse to start and leave the user
+        # with no window at all - the script waits for this PID to disappear
+        # first. This applies to source runs too, where exe_name is None and the
+        # direct Popen below used to race the mutex.
+        if not os.path.isfile(bat_path):
             try:
                 _write_swap_script(bat_path, app_dir, exe_name, [])
             except Exception:
@@ -1508,6 +1915,121 @@ class MissingSalesDialog(QDialog):
         self.preview.append("\n--- Copied to clipboard ---")
 
 
+class AyalaWorker(QThread):
+    """
+    Parses a folder of hourly sales CSVs and writes the reconciliation
+    workbook, off the GUI thread. This used to run inline inside
+    AyalaCheckerDialog.generate_report with periodic processEvents() calls,
+    so a large folder froze the dialog until the whole report was built.
+
+    `processor` is the owning AyalaCheckerDialog. Only its pure methods
+    (parse_hourly_csv, parse_eod_csv, generate_excel) are called from here -
+    none of them touch widgets.
+    """
+    log = pyqtSignal(str)
+    succeeded = pyqtSignal(str)   # output path
+    failed = pyqtSignal(str)
+
+    def __init__(self, folder, output_name, processor, parent=None):
+        super().__init__(parent)
+        self.folder = folder
+        self.output_name = output_name
+        self.processor = processor
+
+    @staticmethod
+    def _file_number(name):
+        """Trailing _<number> in a CSV name, or None when there isn't one."""
+        stem = name[:-4] if name.lower().endswith(".csv") else name
+        match = re.search(r"_(\d+)$", stem)
+        return int(match.group(1)) if match else None
+
+    def run(self):
+        try:
+            self.log.emit("Starting Ayala Checker processing...")
+            self.log.emit(f"Folder: {self.folder}")
+
+            csv_files = sorted(
+                f for f in os.listdir(self.folder) if f.lower().endswith('.csv')
+            )
+            self.log.emit(f"Found {len(csv_files)} CSV file(s)")
+
+            hourly_files = []
+            eod_file = None
+            for csv_file in csv_files:
+                if csv_file.upper().startswith('EOD'):
+                    eod_file = csv_file
+                else:
+                    hourly_files.append(csv_file)
+
+            # Files whose names carry no trailing _<number> are processed last
+            # instead of aborting the run with a ValueError, which is what the
+            # old int(name.split('_')[-1]) sort did on any unexpected file.
+            numbered = [f for f in hourly_files if self._file_number(f) is not None]
+            unnumbered = [f for f in hourly_files if self._file_number(f) is None]
+            numbered.sort(key=self._file_number)
+            unnumbered.sort()
+
+            if unnumbered:
+                self.log.emit(
+                    "⚠️ No transaction number in name, processing last: "
+                    + ", ".join(unnumbered)
+                )
+            hourly_files = numbered + unnumbered
+
+            self.log.emit(f"Hourly sales files: {len(hourly_files)}")
+            self.log.emit(f"EOD file: {eod_file if eod_file else 'Not found'}")
+
+            if not hourly_files:
+                self.failed.emit("No hourly sales CSV files found in the folder.")
+                return
+
+            self.log.emit("")
+            self.log.emit("Parsing hourly sales CSVs...")
+            hourly_transactions = []
+            header = {}
+            for csv_file in hourly_files:
+                file_header, transactions = self.processor.parse_hourly_csv(
+                    os.path.join(self.folder, csv_file)
+                )
+                if not header and file_header:
+                    header = file_header
+                hourly_transactions.extend(transactions)
+                self.log.emit(f"  {csv_file}: {len(transactions)} transaction(s)")
+
+            self.log.emit("")
+            self.log.emit(
+                f"Total transactions from hourly CSVs: {len(hourly_transactions)}"
+            )
+
+            eod_data = {}
+            if eod_file:
+                self.log.emit("")
+                self.log.emit("Parsing EOD CSV...")
+                eod_data = self.processor.parse_eod_csv(
+                    os.path.join(self.folder, eod_file)
+                )
+                self.log.emit(f"  EOD data loaded: {len(eod_data)} fields")
+
+            self.log.emit("")
+            self.log.emit("Generating Excel report...")
+            output_name = self.output_name
+            if not output_name.lower().endswith('.xlsx'):
+                output_name += '.xlsx'
+            output_path = os.path.join(self.folder, output_name)
+            self.processor.generate_excel(
+                hourly_transactions, eod_data, output_path, header
+            )
+
+            self.log.emit("")
+            self.log.emit("✅ Report generated successfully!")
+            self.log.emit(f"Output: {output_path}")
+            self.succeeded.emit(output_path)
+
+        except Exception as e:
+            logger.exception("Ayala Checker error")
+            self.failed.emit(str(e))
+
+
 class AyalaCheckerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1691,82 +2213,61 @@ class AyalaCheckerDialog(QDialog):
             AppDialog("Error", "Selected folder does not exist.", self).exec()
             return
 
+        # The parsing and workbook writing run on AyalaWorker, so the dialog
+        # stays responsive instead of freezing until the report is finished.
         self.generate_btn.setEnabled(False)
         self.generate_btn.setText("Processing...")
-        QtWidgets.QApplication.processEvents()
 
-        try:
-            self.log("Starting Ayala Checker processing...")
-            self.log(f"Folder: {folder}")
+        self.worker = AyalaWorker(folder, self.output_name.text().strip(), self, self)
+        self.worker.log.connect(self.log)
+        self.worker.succeeded.connect(self._on_ayala_succeeded)
+        self.worker.failed.connect(self._on_ayala_failed)
+        self.worker.finished.connect(self._on_ayala_thread_finished)
+        self.worker.start()
 
-            # Find all CSV files
-            csv_files = [f for f in os.listdir(folder) if f.endswith('.csv')]
-            self.log(f"Found {len(csv_files)} CSV file(s)")
+    def _on_ayala_succeeded(self, output_path):
+        self.log("")
+        self.log(f"✅ Report generated:\n{output_path}")
+        AppDialog("Success", f"Report generated:\n{output_path}", self).exec()
 
-            # Separate hourly sales and EOD files
-            hourly_files = []
-            eod_file = None
+    def _on_ayala_failed(self, message):
+        self.log("")
+        self.log(f"❌ Error: {message}")
+        AppDialog("Error", f"Failed to generate report:\n{message}", self).exec()
 
-            for csv_file in csv_files:
-                if csv_file.startswith('EOD'):
-                    eod_file = csv_file
-                else:
-                    hourly_files.append(csv_file)
+    def _on_ayala_thread_finished(self):
+        self.generate_btn.setEnabled(True)
+        self.generate_btn.setText("Generate Report")
 
-            # Sort hourly files by transaction number
-            hourly_files.sort(key=lambda x: int(x.split('_')[-1].replace('.csv', '')))
+    def closeEvent(self, event):
+        """Refuse to close while the worker is still writing the workbook."""
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            self.log("Please wait — the report is still being generated.")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
-            self.log(f"Hourly sales files: {len(hourly_files)}")
-            self.log(f"EOD file: {eod_file if eod_file else 'Not found'}")
-
-            if not hourly_files:
-                AppDialog("Error", "No hourly sales CSV files found in the folder.", self).exec()
-                return
-
-            # Parse hourly sales CSVs
-            self.log("\nParsing hourly sales CSVs...")
-            hourly_transactions = []
-            for csv_file in hourly_files:
-                file_path = os.path.join(folder, csv_file)
-                transactions = self.parse_hourly_csv(file_path)
-                hourly_transactions.extend(transactions)
-                self.log(f"  {csv_file}: {len(transactions)} transaction(s)")
-
-            self.log(f"\nTotal transactions from hourly CSVs: {len(hourly_transactions)}")
-
-            # Parse EOD CSV
-            eod_data = {}
-            if eod_file:
-                self.log("\nParsing EOD CSV...")
-                eod_path = os.path.join(folder, eod_file)
-                eod_data = self.parse_eod_csv(eod_path)
-                self.log(f"  EOD data loaded: {len(eod_data)} fields")
-
-            # Generate Excel output
-            self.log("\nGenerating Excel report...")
-            output_filename = self.output_name.text().strip()
-            if not output_filename.endswith('.xlsx'):
-                output_filename += '.xlsx'
-
-            output_path = os.path.join(folder, output_filename)
-            self.generate_excel(hourly_transactions, eod_data, output_path)
-
-            self.log(f"\n✅ Report generated successfully!")
-            self.log(f"Output: {output_path}")
-
-            AppDialog("Success", f"Report generated:\n{output_path}", self).exec()
-
-        except Exception as e:
-            logger.exception("Ayala Checker error")
-            self.log(f"\n❌ Error: {str(e)}")
-            AppDialog("Error", f"Failed to generate report:\n{str(e)}", self).exec()
-        finally:
-            self.generate_btn.setEnabled(True)
-            self.generate_btn.setText("Generate Report")
+    def reject(self):
+        """Esc must not tear the dialog down mid-run either: the worker calls
+        methods on this object, so it has to outlive the thread."""
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            self.log("Please wait — the report is still being generated.")
+            return
+        super().reject()
 
     def parse_hourly_csv(self, file_path):
-        """Parse an hourly sales CSV file and return list of transactions."""
+        """
+        Parse one hourly sales CSV.
+
+        Returns (header, transactions). The header block (CCCODE,
+        MERCHANT_NAME, TRN_DATE, NO_TRN) is returned on its own: it used to be
+        appended to the transaction list as element 0, which made every hourly
+        file contribute a blank pseudo-transaction to the Excel report.
+        """
         transactions = []
+        header = {}
         current_transaction = None
 
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -1781,12 +2282,10 @@ class AyalaCheckerDialog(QDialog):
 
                 key, value = parts
 
-                # Header fields (only for first transaction in file)
+                # Header fields appear once, before the first transaction
                 if key in ['CCCODE', 'MERCHANT_NAME', 'TRN_DATE', 'NO_TRN']:
                     if current_transaction is None:
-                        if not transactions:
-                            transactions.append({'_header': {}})
-                        transactions[0]['_header'][key] = value
+                        header[key] = value
                     continue
 
                 # Transaction start marker
@@ -1819,7 +2318,7 @@ class AyalaCheckerDialog(QDialog):
             if current_transaction:
                 transactions.append(current_transaction)
 
-        return transactions
+        return header, transactions
 
     def parse_eod_csv(self, file_path):
         """Parse an EOD CSV file and return dictionary of fields."""
@@ -1834,7 +2333,7 @@ class AyalaCheckerDialog(QDialog):
                     eod_data[parts[0]] = parts[1]
         return eod_data
 
-    def generate_excel(self, hourly_transactions, eod_data, output_path):
+    def generate_excel(self, hourly_transactions, eod_data, output_path, header=None):
         """Generate Excel file matching the Sample Output format."""
         wb = Workbook()
         ws = wb.active
@@ -1849,8 +2348,8 @@ class AyalaCheckerDialog(QDialog):
         eod_font = Font(bold=True, size=11, color="006600", name='Calibri')
         eod_fill = PatternFill(start_color="E6FFE6", end_color="E6FFE6", fill_type="solid")
 
-        # Get header from first transaction
-        header = hourly_transactions[0].get('_header', {}) if hourly_transactions else {}
+        # Header block comes from the CSV parser, not from a transaction
+        header = header or {}
 
         # Row 1-4: Header fields
         header_fields = ['CCCODE', 'MERCHANT_NAME', 'TRN_DATE', 'NO_TRN']
@@ -2117,7 +2616,7 @@ class ReportWorker(QThread):
             work_item_url = f"{org_url}/_apis/wit/workitems/{self.work_item_id}?api-version=5.1"
             try:
                 logger.debug("GET %s", work_item_url)
-                resp = requests.get(work_item_url, auth=HTTPBasicAuth("", pat))
+                resp = requests.get(work_item_url, auth=HTTPBasicAuth("", pat), timeout=HTTP_TIMEOUT)
                 resp.raise_for_status()
                 work_item_data = resp.json()
                 logger.info("Work item fetched: id=%s, title=%r", work_item_data.get("id"), work_item_data.get("fields", {}).get("System.Title", "")[:80])
@@ -2133,7 +2632,7 @@ class ReportWorker(QThread):
             comments_url = f"{org_url}/_apis/wit/workItems/{self.work_item_id}/comments?api-version=5.1-preview.3"
             try:
                 logger.debug("GET %s", comments_url)
-                resp = requests.get(comments_url, auth=HTTPBasicAuth("", pat))
+                resp = requests.get(comments_url, auth=HTTPBasicAuth("", pat), timeout=HTTP_TIMEOUT)
                 resp.raise_for_status()
                 comments_data = resp.json()
                 total_comments = len(comments_data.get("comments", []))
@@ -2271,22 +2770,16 @@ class ReportWorker(QThread):
                     "{{DISPLAYN}}": self.user_data["display_name"]  # new placeholder
                 }
 
-                for table in doc.tables:
-                    for row in table.rows:
-                        for cell in row.cells:
-                            for paragraph in cell.paragraphs:
-                                # Plain text placeholders
-                                for ph in ["{{TICKETNUM}}", "{{TICKETCONTENT}}", "{{DATE}}", "{{OS}}", "{{FS}}", "{{CLIENT}}", "{{RCA}}", "{{PREVAC}}", "{{NEXT}}", "{{CURSTAT}}", "{{DISPLAYN}}"]:
-                                    if ph in paragraph.text:
-                                        logger.debug("Replacing %s in table paragraph", ph)
-                                        paragraph.text = paragraph.text.replace(ph, placeholder_map[ph])
+                # The HTML body is rendered run-by-run, so keep it out of the
+                # plain-text pass.
+                content_html = placeholder_map.pop("{{REPORT_CONTENT}}")
 
-                                # HTML content placeholder
-                                if "{{REPORT_CONTENT}}" in paragraph.text:
-                                    logger.debug("Inserting HTML content into {{REPORT_CONTENT}} placeholder")
-                                    for run in paragraph.runs:
-                                        run.text = ""
-                                    add_html_content_to_paragraph(paragraph, placeholder_map["{{REPORT_CONTENT}}"], pat)
+                # Shared engine: body paragraphs, table cells (nested included)
+                # and text boxes are all patched. This used to walk doc.tables
+                # only, so a placeholder moved out of a table silently shipped
+                # as literal text.
+                replace_placeholders_in_doc(doc, placeholder_map)
+                insert_html_into_placeholder(doc, "{{REPORT_CONTENT}}", content_html, pat)
 
                 doc.save(output_path)
                 logger.info("Report saved successfully: %s", output_path)
@@ -2325,7 +2818,7 @@ class PotTicketDataWorker(QThread):
 
         try:
             logger.debug("GET %s", comments_url)
-            resp = requests.get(comments_url, auth=HTTPBasicAuth("", pat))
+            resp = requests.get(comments_url, auth=HTTPBasicAuth("", pat), timeout=HTTP_TIMEOUT)
             resp.raise_for_status()
             comments_data = resp.json()
             total = len(comments_data.get("comments", []))
@@ -3165,7 +3658,7 @@ class LoginWindow(QtWidgets.QWidget):
 
     def show_settings_page(self):
         self.clear_layout()
-        self.set_page_size(460, 520)
+        self.set_page_size(460, 660)
 
         card = QtWidgets.QWidget()
         card.setObjectName("Card")
@@ -3314,6 +3807,46 @@ class LoginWindow(QtWidgets.QWidget):
             self.settings_status.setStyleSheet("color: #16a34a; font-weight: 600; font-size: 12.5px;")
         layout.addWidget(self.settings_status)
 
+        # --- Application / updates ---
+        layout.addSpacing(24)
+
+        divider2 = QtWidgets.QFrame()
+        divider2.setFixedHeight(1)
+        divider2.setStyleSheet(f"background: {tc['divider']}; border: none;")
+        layout.addWidget(divider2)
+        layout.addSpacing(20)
+
+        app_label = QtWidgets.QLabel("APPLICATION")
+        app_label.setStyleSheet(f"""
+            color: {tc['section_label']};
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 1.5px;
+        """)
+        layout.addWidget(app_label)
+        layout.addSpacing(12)
+
+        version_label = QtWidgets.QLabel(f"Installed version: v{APP_VERSION}")
+        version_label.setStyleSheet(f"color: {tc['field_label']}; font-size: 12px;")
+        layout.addWidget(version_label)
+        layout.addSpacing(10)
+
+        update_btn_layout = QtWidgets.QHBoxLayout()
+        self.check_update_btn = QtWidgets.QPushButton("Check for Updates")
+        self.check_update_btn.setFixedHeight(38)
+        self.check_update_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.check_update_btn.clicked.connect(self.check_for_updates_manually)
+        update_btn_layout.addWidget(self.check_update_btn)
+        update_btn_layout.addStretch()
+        layout.addLayout(update_btn_layout)
+
+        layout.addSpacing(8)
+
+        self.update_status_label = QtWidgets.QLabel("")
+        self.update_status_label.setWordWrap(True)
+        self.update_status_label.setStyleSheet("color: #6b7280; font-size: 11.5px;")
+        layout.addWidget(self.update_status_label)
+
         self.main_layout.addWidget(card, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
 
 
@@ -3339,6 +3872,42 @@ class LoginWindow(QtWidgets.QWidget):
         except Exception:
             logger.exception("Failed to save PAT expiry")
             self.settings_status.setText("Failed to save. Check logs.")
+
+
+    def check_for_updates_manually(self):
+        """Settings button: look for a release now instead of on next start."""
+        if getattr(self, "_update_check_running", False):
+            return
+        self._update_check_running = True
+        self.check_update_btn.setEnabled(False)
+        self.check_update_btn.setText("Checking...")
+        self.update_status_label.setStyleSheet("color: #6b7280; font-size: 11.5px;")
+        self.update_status_label.setText("Looking for a newer release...")
+
+        self._update_worker = UpdateCheckWorker(self)
+        self._update_worker.found.connect(self._on_manual_update_result)
+        self._update_worker.finished.connect(self._on_manual_update_finished)
+        self._update_worker.start()
+
+    def _on_manual_update_finished(self):
+        self._update_check_running = False
+        if hasattr(self, "check_update_btn"):
+            self.check_update_btn.setEnabled(True)
+            self.check_update_btn.setText("Check for Updates")
+
+    def _on_manual_update_result(self, update):
+        if not hasattr(self, "update_status_label"):
+            return
+        if not update:
+            self.update_status_label.setText(
+                f"You are on the latest version (v{APP_VERSION})."
+            )
+            return
+
+        self.update_status_label.setText(f"Version {update['version']} is available.")
+        self._update_info = update
+        dlg = UpdateDialog(update["version"], update.get("body", ""), parent=self)
+        dlg.exec()
 
 
     # ================= TOOLS PAGE =================
@@ -4151,46 +4720,11 @@ class LoginWindow(QtWidgets.QWidget):
 
     def _insert_html_into_placeholder(self, doc, placeholder, raw_html):
         """
-        Finds the paragraph containing `placeholder` (in body paragraphs or
-        table cells) and replaces it with rendered HTML content, including
-        embedded images - reusing the same HTML->Word logic as ReportWorker.
+        Delegates to the shared HTML renderer, which covers body paragraphs,
+        table cells (nested too) and text boxes.
         """
-        logger.info("Looking for placeholder %r in document", placeholder)
         pat = self.current_user.get("pat", "") if hasattr(self, "current_user") else ""
-        found = False
-
-        def try_paragraph(paragraph):
-            nonlocal found
-            if placeholder in paragraph.text:
-                logger.debug("Found %r in paragraph text", placeholder)
-                for run in paragraph.runs:
-                    run.text = ""
-                add_html_content_to_paragraph(paragraph, raw_html, pat)
-                found = True
-                return True
-            return False
-
-        # Body paragraphs
-        for para in doc.paragraphs:
-            if try_paragraph(para):
-                return
-
-        # Table cells (including nested tables)
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for para in cell.paragraphs:
-                        if try_paragraph(para):
-                            return
-                    for nested_table in cell.tables:
-                        for nrow in nested_table.rows:
-                            for ncell in nrow.cells:
-                                for npara in ncell.paragraphs:
-                                    if try_paragraph(npara):
-                                        return
-
-        if not found:
-            logger.warning("Placeholder %r was NOT FOUND in any paragraph, table cell, or text box!", placeholder)
+        return insert_html_into_placeholder(doc, placeholder, raw_html, pat)
 
     def open_report_folder(self):
         if hasattr(self, "last_output_path"):
@@ -4413,7 +4947,8 @@ class LoginWindow(QtWidgets.QWidget):
                 url,
                 auth=HTTPBasicAuth('', pat),
                 headers=headers,
-                json=body
+                json=body,
+                timeout=HTTP_TIMEOUT
             )
 
             if response.status_code in (200, 201):
@@ -4586,29 +5121,50 @@ def _focus_running_instance():
 # detect windows theme
 def _cleanup_update_artifacts():
     """
-    Remove files left behind by a previous update attempt:
-      * _update_swap.bat - it already ran, so it must not run again
-      * *.new            - staged files that never got swapped in
-    Called once at startup, after the working directory is set.
+    Remove what the updater leaves behind once it has finished, without ever
+    destroying work that is still pending.
+
+      * _update_swap.bat   - it already ran before this process started
+      * update_extract/    - scratch space from an interrupted extraction
+      * _update_failed.txt - read and logged once, then removed
+
+    *.new files are deliberately KEPT: they belong to a swap that has not
+    completed, and deleting them is what used to make an update disappear
+    silently between launches.
     """
-    if getattr(sys, 'frozen', False):
-        app_dir = os.path.dirname(sys.executable)
-    else:
-        app_dir = os.path.dirname(os.path.abspath(__file__))
+    app_dir = _app_dir()
+
+    failed_path = os.path.join(app_dir, UPDATE_FAILED_FILE)
+    if os.path.isfile(failed_path):
+        try:
+            with open(failed_path, "r", encoding="utf-8", errors="replace") as f:
+                detail = f.read().strip()
+            logger.warning("A previous update could not replace: %s", detail or "(unnamed)")
+        except OSError:
+            logger.warning("A previous update left a failure marker behind")
+        try:
+            os.remove(failed_path)
+        except OSError:
+            logger.warning("Could not remove %s", UPDATE_FAILED_FILE)
+
+    for path in (os.path.join(app_dir, "_update_swap.bat"),
+                 os.path.join(tempfile.gettempdir(), "update_extract")):
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.exists(path):
+                os.remove(path)
+            logger.info("Cleaned up leftover update path: %s", path)
+        except OSError:
+            logger.warning("Could not clean up %s", path)
 
     try:
-        entries = os.listdir(app_dir)
+        pending = [n for n in os.listdir(app_dir) if n.endswith(".new")]
     except OSError:
-        return
-
-    for name in entries:
-        if name == "_update_swap.bat" or name.endswith(".new"):
-            path = os.path.join(app_dir, name)
-            try:
-                os.remove(path)
-                logger.info("Cleaned up leftover update file: %s", name)
-            except OSError:
-                logger.warning("Could not remove leftover update file: %s", name)
+        pending = []
+    if pending:
+        logger.info("Keeping %d staged update file(s) for a pending swap: %s",
+                    len(pending), ", ".join(pending))
 
 
 
@@ -4675,6 +5231,14 @@ if __name__ == "__main__":
         AppDialog("Already Running", "Application is already running.").exec()
         sys.exit(0)
 
+    # If the previous launch was the first one after an update and never got a
+    # window on screen, the new build is broken: put the old files back and
+    # relaunch into them. This must run before _cleanup_update_artifacts(),
+    # which removes the swap script the rollback depends on.
+    if _recover_failed_update():
+        logger.info("Failed update rolled back - exiting so the restored build starts")
+        sys.exit(0)
+
     _cleanup_update_artifacts()
 
     logger.info("=== Application starting (cwd=%s) ===", os.getcwd())
@@ -4695,6 +5259,10 @@ if __name__ == "__main__":
         splash.close()
         app.main_window = window  # keep reference
         logger.info("Main window loaded and shown")
+
+        # A window is on screen, so the build applied by the last update works.
+        # This clears the trial marker that _recover_failed_update() checks.
+        _mark_update_ok()
 
         # Check for updates after UI is visible (non-blocking)
         def check_update():
