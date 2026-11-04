@@ -9,7 +9,7 @@ import winreg
 import ctypes
 import ctypes.wintypes
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
@@ -112,7 +112,7 @@ UPDATE_OK_FILE = "_update_ok.flag"       # written once a window is up
 UPDATE_FAILED_FILE = "_update_failed.txt"  # written by the swap script
 
 # ================= AUTO-UPDATE CONFIG =================
-APP_VERSION = "3.0.9"
+APP_VERSION = "3.0.10"
 GITHUB_REPO = "shinispades/AutoReport"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -150,6 +150,15 @@ TOOL_REGISTRY = [
         "description": "Compare hourly sales CSVs against EOD CSV and generate organized Excel report",
         "icon": "📊",
         "handler": "run_tool_2",
+        "category": "Reports",
+    },
+    # --- Scheduled TFS Comment ---
+    {
+        "id": "scheduled_comment",
+        "name": "Scheduled Comment",
+        "description": "Write a TFS comment with images and links, then let the hosted worker post it at the time you choose",
+        "icon": "⏰",
+        "handler": "run_scheduled_comment",
         "category": "Reports",
     },
     # --- Tool 3 ---
@@ -900,7 +909,9 @@ def _write_swap_script(bat_path, app_dir, exe_name, locked_files):
 #     allow read, write: if request.auth != null && request.auth.uid == uid;
 #   }
 #
-# TFS PATs are no longer stored in Firestore at all - see _save_pat_local().
+# The users/{uid} rules must stay owner-only: with PAT_SYNC_TO_FIRESTORE on,
+# the TFS PAT is kept in that document. Anyone who can read the collection -
+# a leaked key, a wrong rule - is then holding the token. See _save_pat_remote().
 #
 # Auth is two plain HTTP endpoints (Identity Toolkit + Secure Token), so the
 # unmaintained pyrebase package - and the gcloud/oauth2client/pycryptodome
@@ -923,6 +934,13 @@ FIRESTORE_API = (
 
 
 FIREBASE_API_KEY = _firebase_config["apiKey"]
+
+# Scheduled comments: written on this PC, stored in Firestore, posted by
+# scheduled_comment_worker.py running on an always-on host. The app writes
+# them; the worker only reads pending ones and updates their status. Both talk
+# to Firestore as an authenticated user, so the security rules decide who may
+# touch what - still no service account key anywhere.
+SCHEDULED_COMMENTS_COLLECTION = "scheduledComments"
 IDENTITY_API = "https://identitytoolkit.googleapis.com/v1/accounts"
 SECURE_TOKEN_API = "https://securetoken.googleapis.com/v1/token"
 
@@ -1025,6 +1043,55 @@ def _fs_decode(value):
     return ""
 
 
+def _fs_error_detail(resp):
+    """Best-effort message from a Google API error body.
+
+    runQuery streams its result, so a rules denial arrives as a JSON *array*
+    holding one status object rather than a dict. Assuming a dict there raised
+    AttributeError and hid the actual reason, which is the one thing the user
+    needs to see.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    if isinstance(body, list):
+        body = next((item for item in body if isinstance(item, dict)), None)
+    if not isinstance(body, dict):
+        return ""
+    error = body.get("error")
+    if isinstance(error, list):
+        error = next((item for item in error if isinstance(item, dict)), None)
+    if isinstance(error, dict):
+        return error.get("message", "") or ""
+    if isinstance(error, str):
+        return error
+    return ""
+
+
+def _fs_denied_error(collection, resp):
+    """Build the user-facing error for a 401/403 from Firestore.
+
+    The bare "rules must allow" sentence cannot tell apart the three things
+    that produce a 403 here: the rules really do deny the call, the ID token
+    was rejected (so request.auth is null), or the Cloud Firestore API is not
+    enabled for the project. Google's own message does, so it is appended.
+    """
+    detail = _fs_error_detail(resp)
+    if resp.status_code == 401:
+        message = ("Your Firebase session was rejected. Sign in again to get "
+                   "a fresh token.")
+    else:
+        message = (
+            f"The database refused the request for '{collection}'. The "
+            f"Firestore rules must allow the signed-in user to use that "
+            f"collection."
+        )
+    if detail and detail not in message:
+        message = f"{message} ({detail})"
+    return FirebaseError(message, status=resp.status_code)
+
+
 def _fs_request(method, path, id_token, payload=None, allow_missing=False):
     """One Firestore REST call, authenticated as the signed-in user.
 
@@ -1047,18 +1114,15 @@ def _fs_request(method, path, id_token, payload=None, allow_missing=False):
     if resp.status_code == 404 and allow_missing:
         return None
     if resp.status_code in (401, 403):
-        logger.warning("Firestore %s %s -> %d", method, path, resp.status_code)
-        raise FirebaseError(
-            "The database refused the request. Firestore rules must allow the "
-            "signed-in user to read and write their own users/{uid} document.",
-            status=resp.status_code,
-        )
+        logger.warning("Firestore %s %s -> %d %s", method, path,
+                       resp.status_code, _fs_error_detail(resp))
+        # Name the collection that was actually refused. Pointing at
+        # users/{uid} every time sent people hunting in the wrong rules block
+        # when the failing call was for a different collection.
+        collection = path.split("?", 1)[0].split("/", 1)[0]
+        raise _fs_denied_error(collection, resp)
     if resp.status_code >= 400:
-        detail = ""
-        try:
-            detail = (resp.json().get("error") or {}).get("message", "")
-        except ValueError:
-            pass
+        detail = _fs_error_detail(resp)
         logger.error("Firestore %s %s -> %d %s", method, path, resp.status_code, detail)
         raise FirebaseError(
             f"Database error {resp.status_code}: {detail or resp.text[:120]}",
@@ -1081,8 +1145,7 @@ def _load_profile(uid, id_token):
 def _update_profile(uid, id_token, values):
     """Merge `values` into users/{uid}, creating the document when absent.
 
-    A value of None deletes that field, which is how the legacy plain-text
-    `pat` field is removed after it has been migrated to the local store.
+    A value of None deletes that field.
     """
     if not uid:
         raise FirebaseError("No signed-in user.")
@@ -1140,10 +1203,115 @@ def _update_user_profile(user_data, values):
         _update_profile(uid, token, values)
 
 
+def _fs_create(collection, id_token, values):
+    """Create a document with a server-assigned id. Returns that id."""
+    if not id_token:
+        raise FirebaseError("Your session expired. Please sign in again.")
+    resp = _fs_request(
+        "POST", collection, id_token,
+        {"fields": {k: _fs_value(v) for k, v in values.items()}},
+    )
+    name = (resp.json() or {}).get("name", "")
+    return name.rsplit("/", 1)[-1]
+
+
+def _fs_query(collection, id_token, field=None, value=None, limit=100):
+    """Query a collection and return documents as flat dicts, id included.
+
+    Deliberately filtered on one field with no order-by: Firestore serves those
+    from its automatic single-field indexes, so this works on a fresh project
+    without anyone having to build a composite index first. Ordering is done in
+    Python - there are only a handful of rows.
+    """
+    if not id_token:
+        raise FirebaseError("Your session expired. Please sign in again.")
+
+    structured = {
+        "from": [{"collectionId": collection}],
+        "limit": limit,
+    }
+    if field:
+        structured["where"] = {
+            "fieldFilter": {
+                "field": {"fieldPath": field},
+                "op": "EQUAL",
+                "value": _fs_value(value),
+            }
+        }
+
+    try:
+        resp = requests.post(
+            f"{FIRESTORE_API}:runQuery",
+            headers={
+                "Authorization": f"Bearer {id_token}",
+                "Content-Type": "application/json",
+            },
+            json={"structuredQuery": structured},
+            timeout=HTTP_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        raise FirebaseError(
+            f"Could not reach the database ({e.__class__.__name__})."
+        ) from e
+
+    if resp.status_code in (401, 403):
+        # Same wording as _fs_request: name the collection that was refused so
+        # nobody goes looking in the users/{uid} rules block for a schedule
+        # permission problem.
+        logger.warning("Firestore query on %s -> %d %s", collection,
+                       resp.status_code, _fs_error_detail(resp))
+        raise _fs_denied_error(collection, resp)
+    if resp.status_code >= 400:
+        detail = _fs_error_detail(resp)
+        logger.error("Firestore query on %s -> %d %s", collection, resp.status_code, detail)
+        raise FirebaseError(
+            f"Database error {resp.status_code}: {detail or resp.text[:120]}",
+            status=resp.status_code,
+        )
+
+    documents = []
+    for row in resp.json() or []:
+        doc = row.get("document")
+        if not doc:
+            continue    # runQuery sends a bare readTime for rows with no document
+        item = {k: _fs_decode(v) for k, v in (doc.get("fields") or {}).items()}
+        item["id"] = (doc.get("name") or "").rsplit("/", 1)[-1]
+        documents.append(item)
+    return documents
+
+
+def _fs_delete(collection, doc_id, id_token):
+    """Delete one document."""
+    if not id_token:
+        raise FirebaseError("Your session expired. Please sign in again.")
+    _fs_request("DELETE", f"{collection}/{doc_id}", id_token)
+
+
 # ================= LOCAL SECRET STORAGE =================
-# The TFS PAT is a credential. Kept in Firestore it was readable by anyone
-# holding the previously shipped service-account key; it is now encrypted with
-# DPAPI for the current Windows user and stored under %LOCALAPPDATA%.
+# The TFS PAT is a credential. It is encrypted with DPAPI for the current
+# Windows user and stored under %LOCALAPPDATA%, which keeps it out of reach of
+# other Windows users on the same PC and of anything reading the database.
+#
+# PAT_SYNC_TO_FIRESTORE mirrors it into this user's own document so the same
+# account works on any PC without re-entering the token. Trade-off: the PAT is
+# then stored in Firestore in plain text and is only as private as the
+# users/{uid} rules (owner-only) and the project's access controls. Set this
+# to False to return to per-machine-only storage.
+PAT_SYNC_TO_FIRESTORE = True
+
+# A scheduled comment is posted later by the hosted worker, which needs the
+# author's PAT at post time. Keeping the token only in users/{uid} makes that
+# depend on the worker being allowed to read every user document - a rules
+# edit that fails silently, and when it fails the comment is posted with the
+# worker's own TFS_PAT and credited to that person instead.
+#
+# With this on, the token is also written into the schedule document itself
+# (scheduledComments/{id}.pat), which the worker already has read access to,
+# so a comment is credited to the user who scheduled it whatever the rules for
+# users/{uid} say. The cost is one more copy of the secret in Firestore, so
+# reads of scheduledComments must stay limited to the owner and the worker
+# (see the rules in the README).
+COPY_PAT_INTO_SCHEDULE = True
 
 def _credential_dir():
     base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
@@ -1192,6 +1360,25 @@ def _save_pat_local(uid, pat):
         return True
     except Exception:
         logger.exception("Could not store the PAT locally")
+        return False
+
+
+def _save_pat_remote(uid, id_token, pat):
+    """Mirror the PAT into users/{uid} so any PC can sign in with it.
+
+    Best effort: a failure here (offline, rules rejecting the write) leaves the
+    local DPAPI copy in charge, so login still works on this machine.
+    """
+    if not PAT_SYNC_TO_FIRESTORE:
+        return False
+    if not (uid and id_token and pat):
+        return False
+    try:
+        _update_profile(uid, id_token, {"pat": pat})
+        logger.info("PAT synced to Firestore for uid=%s", uid)
+        return True
+    except FirebaseError as e:
+        logger.warning("Could not sync the PAT to Firestore: %s", e)
         return False
 
 
@@ -1384,6 +1571,255 @@ def _fetch_image_bytes(url, pat=""):
         _image_cache.clear()
     _image_cache[candidate] = resp.content
     return resp.content
+
+
+def _utc_now_iso():
+    """UTC timestamp in the fixed format the worker compares against.
+
+    Fixed width on purpose: plain string comparison is then chronological,
+    which is how the worker decides what is due without a Firestore range
+    index.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Bare URLs in a comment become real links. Stopping at whitespace and quotes
+# keeps a URL that ends a sentence from swallowing the full stop - trailing
+# punctuation is put back outside the anchor.
+_URL_PATTERN = re.compile(r"(https?://[^\s<>\"']+)", re.IGNORECASE)
+
+
+def _escape_comment_text(text):
+    return (
+        (text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _linkify_escaped(escaped):
+    """Wrap bare URLs in already-escaped text with anchors."""
+    def _link(match):
+        url = match.group(1)
+        trailing = ""
+        while url and url[-1] in ".,;:!?":
+            trailing = url[-1] + trailing
+            url = url[:-1]
+        return f'<a href="{url}">{url}</a>{trailing}'
+
+    return _URL_PATTERN.sub(_link, escaped)
+
+
+# Tags a comment may contain after the rich editor's HTML is normalised.
+# Anything else is unwrapped to its text, or dropped along with its content.
+_COMMENT_INLINE_TAGS = ("b", "strong", "i", "em", "u", "s", "strike", "code")
+_COMMENT_URL_SCHEME = re.compile(r"^(?:https?|mailto):", re.IGNORECASE)
+_COMMENT_IMAGE_URL = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def _qt_span_tags(style):
+    """Qt writes bold/italic/underline as a styled <span>; name the tags.
+
+    Qt emits `font-weight:600`, `font-style:italic` and `text-decoration:
+    underline` with a space after the colon, so each is matched loosely.
+    """
+    opens, closes = "", ""
+    weight = re.search(r"font-weight:\s*(bold|\d+)", style)
+    if weight:
+        value = weight.group(1)
+        if value == "bold" or int(value) >= 600:
+            opens += "<b>"
+            closes = "</b>" + closes
+    if re.search(r"font-style:\s*italic", style):
+        opens += "<i>"
+        closes = "</i>" + closes
+    if re.search(r"text-decoration:\s*[^;]*underline", style):
+        opens += "<u>"
+        closes = "</u>" + closes
+    if re.search(r"text-decoration:\s*[^;]*line-through", style):
+        opens += "<s>"
+        closes = "</s>" + closes
+    return opens, closes
+
+
+def _rich_comment_html(document_html, image_urls=None, placed=None):
+    """Turn the editor's rich document into the HTML TFS stores.
+
+    Only the tags listed above (plus paragraphs, lists and plain hyperlinks)
+    survive, so a paste from a browser or Word cannot smuggle in styles,
+    scripts or other references. Text is escaped and bare URLs are linked, so
+    the result is safe whatever was pasted.
+
+    A picture pasted into the box lives on this PC until it is uploaded as a
+    work item attachment. `image_urls` maps the name Qt gives that picture (its
+    temp file name) to the attachment URL, so the picture is written where it
+    was in the comment rather than collected at the end; every name it uses is
+    added to `placed`, so _comment_html does not append it a second time. An
+    http(s) <img> that already points at a server is kept as it is, which is
+    how a picture copied out of another ticket stays visible.
+    """
+    image_urls = image_urls or {}
+    placed = placed if placed is not None else set()
+    soup = BeautifulSoup(document_html or "", "html.parser")
+    root = soup.body or soup
+    out = []
+    last_break = [True]
+
+    def br():
+        if not last_break[0]:
+            out.append("<br>")
+            last_break[0] = True
+
+    def walk(node):
+        for child in node.children:
+            if isinstance(child, NavigableString):
+                text = str(child)
+                if text.strip():
+                    out.append(_linkify_escaped(_escape_comment_text(text)))
+                    last_break[0] = False
+                continue
+            if not isinstance(child, Tag):
+                continue
+            name = child.name.lower()
+            if name in ("script", "style", "head", "title", "meta"):
+                continue
+            if name in ("p", "div", "blockquote"):
+                br()
+                walk(child)
+                br()
+                continue
+            if name == "br":
+                # Always emitted: an empty paragraph is how the editor stores
+                # a blank line, and dropping it would join the paragraphs.
+                out.append("<br>")
+                last_break[0] = True
+                continue
+            if name == "span":
+                opens, closes = _qt_span_tags((child.get("style") or "").lower())
+                if opens:
+                    out.append(opens)
+                    walk(child)
+                    out.append(closes)
+                else:
+                    walk(child)
+                continue
+            if name == "a":
+                href = (child.get("href") or "").strip()
+                if _COMMENT_URL_SCHEME.match(href):
+                    out.append(f'<a href="{_escape_comment_text(href)}">')
+                    walk(child)
+                    out.append("</a>")
+                else:
+                    walk(child)
+                continue
+            if name == "img":
+                src = (child.get("src") or "").strip()
+                if _COMMENT_IMAGE_URL.match(src):
+                    out.append(f'<img src="{_escape_comment_text(src)}">')
+                    last_break[0] = False
+                    continue
+                # A picture pasted into the box is named after its file on
+                # disk; that name is the key its upload is filed under, so it
+                # can be written here instead of being gathered at the end.
+                key = os.path.basename(src)
+                uploaded = image_urls.get(key) or image_urls.get(src) or ""
+                if uploaded:
+                    out.append(f'<img src="{_escape_comment_text(uploaded)}">')
+                    placed.add(key)
+                    last_break[0] = False
+                continue
+            if name in ("ul", "ol"):
+                br()
+                out.append(f"<{name}>")
+                walk(child)
+                out.append(f"</{name}>")
+                br()
+                continue
+            if name == "li":
+                out.append("<li>")
+                last_break[0] = True      # no break at the very start of an item
+                walk(child)
+                out.append("</li>")
+                last_break[0] = False
+                continue
+            if name in _COMMENT_INLINE_TAGS:
+                out.append(f"<{name}>")
+                walk(child)
+                out.append(f"</{name}>")
+                continue
+            walk(child)                    # unknown tag: keep only its text
+
+    walk(root)
+    result = "".join(out).strip()
+    result = re.sub(r"(?:<br>)+(?=</li>)", "", result)
+    result = re.sub(r"^(?:<br>)+", "", result)
+    return re.sub(r"(?:<br>)+$", "", result)
+
+
+def _comment_html(text, image_urls=None, rich_html=""):
+    """Turn the compose box into the HTML TFS stores.
+
+    `rich_html` is what the comment editor produces (paragraphs, lists,
+    bold/italic/underline, links, pictures) and goes through
+    _rich_comment_html, which keeps a fixed set of tags and nothing else.
+    Without it the plain text is escaped first, so a comment can never inject
+    markup: only the links wrapped below and the attachment images are real
+    tags.
+
+    `image_urls` maps a picture's file name to the attachment URL it was
+    uploaded to, so a pasted picture is written back into the comment at the
+    place it was typed. One that has no place left in the text - a picture
+    deleted from the box after it was attached - is appended at the end.
+    """
+    keyed = isinstance(image_urls, dict)
+    uploads = image_urls if keyed else {}
+    unplaced = [] if keyed else [url for url in (image_urls or []) if url]
+    placed = set()
+
+    if rich_html:
+        body = _rich_comment_html(rich_html, uploads, placed)
+    else:
+        escaped = _escape_comment_text(text)
+        body = "<br>".join(
+            re.split(r"\r\n|\r|\n", _linkify_escaped(escaped))
+        )
+
+    unplaced += [url for name, url in uploads.items()
+                 if url and name not in placed]
+    if unplaced:
+        body += "".join(f'<br><img src="{url}">' for url in unplaced)
+    return body.strip()
+
+
+def _upload_comment_image(pat, work_item_id, file_path):
+    """Upload an image as a work item attachment and return its URL.
+
+    Images are attached at compose time on purpose: the worker on the host
+    cannot read this PC's disk, and a TFS attachment URL keeps working no
+    matter when the comment is finally posted.
+    """
+    from urllib.parse import quote
+
+    name = os.path.basename(file_path)
+    with open(file_path, "rb") as handle:
+        payload = handle.read()
+
+    url = f"{org_url}/_apis/wit/attachments?fileName={quote(name)}&api-version=5.1"
+    logger.info("Uploading image for work item %s: %s (%d bytes)",
+                work_item_id, name, len(payload))
+    resp = requests.post(
+        url,
+        auth=HTTPBasicAuth("", pat),
+        data=payload,
+        headers={"Content-Type": "application/octet-stream"},
+        timeout=DOWNLOAD_TIMEOUT,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"TFS rejected {name} ({resp.status_code}): {resp.text[:160]}"
+        )
+    return (resp.json() or {}).get("url", "")
 
 
 def add_html_content_to_paragraph(paragraph, html_content, pat=""):
@@ -1621,24 +2057,26 @@ class LoginWorker(QThread):
                 "refresh_token": session["refresh_token"],
             }
 
-            # Local store first. Accounts created by older builds still carry
-            # the PAT as a plain field in Firestore; move it once and delete it.
+            # Local store first: it is fast and works without Firestore. With
+            # PAT_SYNC_TO_FIRESTORE on, users/{uid}.pat is the copy that lets
+            # the same account sign in on another PC.
             pat = _load_pat_local(uid)
-            legacy_pat = profile.get("pat", "")
-            if not pat and legacy_pat:
-                if _save_pat_local(uid, legacy_pat):
-                    pat = legacy_pat
-                    try:
-                        _update_profile(uid, id_token, {"pat": None})
-                        logger.info("Legacy Firestore PAT migrated and removed")
-                    except FirebaseError:
-                        logger.warning(
-                            "Migrated the PAT but could not delete the old field "
-                            "from Firestore - remove users/%s.pat by hand", uid
-                        )
+            remote_pat = (profile.get("pat") or "").strip()
+            if not pat and remote_pat:
+                pat = remote_pat
+                if _save_pat_local(uid, pat):
+                    logger.info("PAT restored from Firestore for uid=%s", uid)
+            elif pat and pat != remote_pat:
+                # The local copy is authoritative: publish it when the remote
+                # one is empty (first login after upgrading) and refresh it
+                # when the token was regenerated. The worker posts comments
+                # with users/{uid}.pat, so a stale copy there would make every
+                # schedule from this account fail with a 401.
+                if _save_pat_remote(uid, id_token, pat) and remote_pat:
+                    logger.info("Refreshed the Firestore PAT for uid=%s", uid)
 
             if not pat:
-                logger.warning("No PAT available locally for uid=%s", uid)
+                logger.warning("No PAT available for uid=%s", uid)
                 self.pat_required.emit(data)
                 return
 
@@ -3487,6 +3925,929 @@ class PotTicketDataWorker(QThread):
 
         self.done.emit(self.raw_html)
 
+
+def _write_temp_image(image):
+    """Save a QImage as a PNG in the temp folder; return the path ("" on failure).
+
+    A picture that only exists inside the document cannot be uploaded: the
+    worker on the host has no access to this PC, and clipboard data is gone
+    once the dialog closes. A real file also survives a restart of the app.
+    """
+    if image is None or image.isNull():
+        return ""
+    directory = os.path.join(tempfile.gettempdir(), "AutoReport-pasted")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        name = f"pasted-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.png"
+        path = os.path.join(directory, name)
+        if not image.save(path, "PNG"):
+            logger.warning("Could not write a pasted image to %s", path)
+            return ""
+        return path
+    except OSError:
+        logger.exception("Could not store a pasted image")
+        return ""
+
+
+class RemoteImageFetcher(QThread):
+    """Download a picture referenced by pasted HTML so it can be displayed.
+
+    A comment copied out of TFS carries <img src="https://tfs/..."> tags. Qt
+    cannot fetch those (they need the reader's token), so it paints an empty
+    box. Pulling the bytes down here fixes both halves of the problem: the
+    picture shows in the editor, and it becomes a file that can be uploaded
+    with the comment instead of a URL that may expire.
+    """
+
+    fetched = pyqtSignal(str, str)      # source URL, saved path ("" on failure)
+
+    def __init__(self, url, pat="", parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.pat = pat
+
+    def run(self):
+        try:
+            auth = None
+            if self.pat:
+                from urllib.parse import urlparse
+                # Only hand the token to our own TFS; a picture hosted
+                # anywhere else must not receive it.
+                if (urlparse(self.url).netloc.lower()
+                        == urlparse(org_url).netloc.lower()):
+                    auth = HTTPBasicAuth("", self.pat)
+            resp = requests.get(self.url, auth=auth, timeout=DOWNLOAD_TIMEOUT)
+            if resp.status_code >= 400:
+                logger.warning("Picture %s answered HTTP %s - left as a link",
+                               self.url, resp.status_code)
+                self.fetched.emit(self.url, "")
+                return
+            image = QtGui.QImage()
+            if not image.loadFromData(resp.content):
+                logger.warning("Picture %s is not a readable image", self.url)
+                self.fetched.emit(self.url, "")
+                return
+            self.fetched.emit(self.url, _write_temp_image(image))
+        except Exception:
+            logger.exception("Could not download a pasted picture")
+            self.fetched.emit(self.url, "")
+
+
+class CommentEditor(QTextEdit):
+    """The comment box: Word-style lists, character formatting, image paste.
+
+    Three things a plain QTextEdit does not do, all of which the team expects
+    from Word:
+
+      * typing "*" (or "-" / "+") and then space at the start of a line
+        starts a bulleted list, "1." and space a numbered one;
+      * Ctrl+B / Ctrl+I / Ctrl+U format the selection, or whatever is typed
+        next, and the result is sent to TFS as real <b>/<i>/<u>;
+      * pasting a picture inserts it here and adds it to the comment's
+        attachments, so it is uploaded instead of silently dropped;
+      * a picture copied out of another ticket arrives as a URL, which Qt
+        draws as an empty box - it is downloaded with your token first, so
+        what you see is the picture itself.
+
+    Pasted pictures are written to a temp PNG because an image embedded only in
+    the document cannot be uploaded: the worker on the host has no access to
+    this PC, and the clipboard data is gone once the dialog closes.
+    """
+
+    image_added = pyqtSignal(str)      # absolute path of a file to attach
+
+    _BULLET_MARKERS = ("*", "-", "+", "\u2022")
+    _NUMBER_MARKER = re.compile(r"\d{1,3}[.)]")
+
+    def __init__(self, pat="", parent=None):
+        super().__init__(parent)
+        self.setAcceptRichText(True)
+        self._pat = pat
+        self._attached = []        # pasted paths, to avoid uploading twice
+        self._fetchers = []        # running downloads, kept alive until done
+        self._fetching = set()     # URLs already requested
+
+    # --- images ---
+
+    def canInsertFromMimeData(self, source):
+        return source.hasImage() or super().canInsertFromMimeData(source)
+
+    @staticmethod
+    def _clipboard_image(source):
+        """The clipboard's picture, however Qt hands it over."""
+        data = source.imageData()
+        if isinstance(data, QtGui.QImage):
+            return data
+        if isinstance(data, QtGui.QPixmap):
+            return data.toImage()
+        try:
+            return QtGui.QImage(data)
+        except TypeError:
+            return QtGui.QImage()
+
+    def insertFromMimeData(self, source):
+        if source.hasImage():
+            image = self._clipboard_image(source)
+            path = _write_temp_image(image)
+            if path and self._insert_local_image(path):
+                if path not in self._attached:
+                    self._attached.append(path)
+                    self.image_added.emit(path)
+                return
+        super().insertFromMimeData(source)
+        # A comment copied out of TFS arrives as HTML whose pictures are URLs,
+        # not bytes: Qt draws them as empty boxes until they are fetched.
+        if source.hasHtml():
+            self._fetch_remote_images(source.html())
+
+    @staticmethod
+    def _remote_image_urls(html):
+        urls = []
+        for img in BeautifulSoup(html or "", "html.parser").find_all("img"):
+            src = (img.get("src") or "").strip()
+            if _COMMENT_IMAGE_URL.match(src) and src not in urls:
+                urls.append(src)
+        return urls
+
+    def _fetch_remote_images(self, html):
+        for url in self._remote_image_urls(html):
+            if url in self._fetching:
+                continue
+            self._fetching.add(url)
+            fetcher = RemoteImageFetcher(url, self._pat, self)
+            fetcher.fetched.connect(self._on_image_fetched)
+            fetcher.finished.connect(self._forget_fetcher)
+            self._fetchers.append(fetcher)
+            fetcher.start()
+
+    def _forget_fetcher(self):
+        sender = self.sender()
+        if sender in self._fetchers:
+            self._fetchers.remove(sender)
+
+    def _on_image_fetched(self, url, path):
+        """Swap a downloaded picture into the box where the empty box was."""
+        self._fetching.discard(url)
+        if not path:
+            return          # the URL stays in the document and still posts
+        if not self._replace_image(url, path):
+            logger.warning("Downloaded %s but it is no longer in the comment", url)
+            return
+        if path not in self._attached:
+            self._attached.append(path)
+            self.image_added.emit(path)
+
+    @staticmethod
+    def _same_image(name, url):
+        """Does this image fragment hold that URL? (Qt may normalise it.)"""
+        name = (name or "").strip()
+        url = (url or "").strip()
+        return name == url or name.rstrip("/") == url.rstrip("/")
+
+    def _replace_image(self, url, path):
+        """Replace every fragment holding the URL with the downloaded file."""
+        image = QtGui.QImage(path)
+        if image.isNull():
+            return False
+        available = max(self.viewport().width() - 40, 160)
+        if image.width() > available:
+            image = image.scaledToWidth(
+                available, QtCore.Qt.TransformationMode.SmoothTransformation
+            )
+
+        document = self.document()
+        targets = []
+        block = document.begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid() and fragment.charFormat().isImageFormat():
+                    name = fragment.charFormat().toImageFormat().name()
+                    if self._same_image(name, url):
+                        targets.append((fragment.position(), fragment.length()))
+                iterator += 1
+            block = block.next()
+
+        # Back to front, so earlier positions stay valid.
+        name = os.path.basename(path)
+        for position, length in reversed(targets):
+            cursor = QtGui.QTextCursor(document)
+            cursor.setPosition(position)
+            cursor.setPosition(position + length,
+                               QtGui.QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+            cursor.insertImage(image, name)
+        return bool(targets)
+
+    def _insert_local_image(self, path):
+        """Show the picture in the editor, scaled to the box's width."""
+        image = QtGui.QImage(path)
+        if image.isNull():
+            return False
+        available = max(self.viewport().width() - 40, 160)
+        if image.width() > available:
+            image = image.scaledToWidth(
+                available, QtCore.Qt.TransformationMode.SmoothTransformation
+            )
+        cursor = self.textCursor()
+        cursor.insertImage(image, os.path.basename(path))
+        self.setTextCursor(cursor)
+        return True
+
+    def image_names(self):
+        """File names of the pictures currently in the document.
+
+        The dialog compares this against its attachment list: a picture
+        deleted from the box must not be uploaded with the comment.
+        """
+        names = set()
+        block = self.document().begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid() and fragment.charFormat().isImageFormat():
+                    name = fragment.charFormat().toImageFormat().name()
+                    names.add(os.path.basename(name))
+                iterator += 1
+            block = block.next()
+        return names
+
+    def clear_attachments(self):
+        """Forget pasted pictures and take them out of the document.
+
+        Used when a saved schedule is cleared: a picture left visible in the
+        box would look like it is still going to be uploaded with the next
+        comment, so it is removed. The typed text is not touched.
+        """
+        self._attached = []
+        document = self.document()
+        block = document.begin()
+        while block.isValid():
+            images = []
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                if fragment.isValid() and fragment.charFormat().isImageFormat():
+                    images.append((fragment.position(), fragment.length()))
+                iterator += 1
+            # Back to front, so earlier positions stay valid.
+            for position, length in reversed(images):
+                cursor = QtGui.QTextCursor(document)
+                cursor.setPosition(position)
+                cursor.setPosition(position + length,
+                                   QtGui.QTextCursor.MoveMode.KeepAnchor)
+                cursor.removeSelectedText()
+            block = block.next()
+
+    # --- typing ---
+
+    def keyPressEvent(self, event):
+        if event.modifiers() == QtCore.Qt.KeyboardModifier.ControlModifier:
+            key = event.key()
+            if key == QtCore.Qt.Key.Key_B:
+                self._toggle("bold")
+                return
+            if key == QtCore.Qt.Key.Key_I:
+                self._toggle("italic")
+                return
+            if key == QtCore.Qt.Key.Key_U:
+                self._toggle("underline")
+                return
+        if (event.key() == QtCore.Qt.Key.Key_Space
+                and not self.textCursor().hasSelection()
+                and self._autoformat_list()):
+            return
+        super().keyPressEvent(event)
+
+    def _toggle(self, kind):
+        """Word's Ctrl+B / Ctrl+I / Ctrl+U for the selection or the next word."""
+        fmt = QtGui.QTextCharFormat()
+        if kind == "bold":
+            fmt.setFontWeight(400 if self.fontWeight() >= 700 else 700)
+        elif kind == "italic":
+            fmt.setFontItalic(not self.fontItalic())
+        else:
+            fmt.setFontUnderline(not self.fontUnderline())
+        self.mergeCurrentCharFormat(fmt)
+        self.setFocus()
+
+    def _autoformat_list(self):
+        """Turn a leading "* " / "- " / "1. " into a real list, Word-style."""
+        cursor = self.textCursor()
+        block_text = cursor.block().text()
+        if cursor.positionInBlock() != len(block_text):
+            return False           # only when the marker is the last thing typed
+        marker = block_text.strip()
+        if not marker:
+            return False
+        if marker in self._BULLET_MARKERS:
+            style = QtGui.QTextListFormat.Style.ListDisc
+        elif self._NUMBER_MARKER.fullmatch(marker):
+            style = QtGui.QTextListFormat.Style.ListDecimal
+        else:
+            return False
+
+        indent = max(len(block_text) - len(marker), 0)
+        fmt = QtGui.QTextListFormat()
+        fmt.setStyle(style)
+        fmt.setIndent(1 + indent // 2)
+
+        cursor.beginEditBlock()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.StartOfBlock)
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.EndOfBlock,
+                            QtGui.QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.createList(fmt)
+        cursor.endEditBlock()
+        self.setTextCursor(cursor)
+        return True
+
+
+class ScheduleCommentWorker(QThread):
+    """Uploads any images, builds the comment HTML and stores the schedule.
+
+    Everything that touches the network happens here: each image upload can
+    take seconds, and the dialog has to stay responsive while it runs.
+    """
+    progress = pyqtSignal(str)
+    saved = pyqtSignal(str)      # Firestore document id
+    failed = pyqtSignal(str)
+
+    def __init__(self, user_data, work_item_id, due_at, body, image_paths,
+                 parent=None, body_html=""):
+        super().__init__(parent)
+        self.user_data = user_data
+        self.work_item_id = work_item_id
+        self.due_at = due_at
+        self.body = body
+        self.body_html = body_html
+        self.image_paths = image_paths or []
+
+    def run(self):
+        try:
+            pat = self.user_data.get("pat", "")
+            if not pat:
+                self.failed.emit("No TFS token on this PC. Sign in again to store one.")
+                return
+
+            # Keyed by the name the editor gives each picture, so _comment_html
+            # can put it back where it was typed instead of at the end.
+            uploads = {}
+            image_urls = []
+            for index, path in enumerate(self.image_paths, 1):
+                self.progress.emit(f"Uploading image {index}/{len(self.image_paths)}...")
+                url = _upload_comment_image(pat, self.work_item_id, path)
+                image_urls.append(url)
+                uploads[os.path.basename(path)] = url
+
+            html = _comment_html(self.body, uploads, self.body_html)
+            if not html.strip():
+                self.failed.emit("The comment is empty.")
+                return
+
+            self.progress.emit("Saving the schedule...")
+
+            # The object-replacement character marks where an inline picture
+            # sits in the editor. It is meaningless in the text copy kept for
+            # the list preview, where it shows up as a box.
+            body_text = (self.body or "").replace("\ufffc", "").strip()
+
+            values = {
+                "owner_uid": self.user_data.get("uid", ""),
+                "owner_email": self.user_data.get("email", ""),
+                "work_item_id": str(self.work_item_id),
+                "due_at": self.due_at,
+                "body_text": body_text,
+                "html": html,
+                "image_urls": "\n".join(image_urls),
+                "status": "pending",
+                "created_at": _utc_now_iso(),
+                "attempts": 0,
+                "last_error": "",
+                "posted_at": "",
+            }
+            if COPY_PAT_INTO_SCHEDULE:
+                # The worker posts with this, so the comment is authored by the
+                # person who scheduled it even when the worker is not allowed
+                # to read that person's users/{uid} document.
+                values["pat"] = pat
+
+            token = _refresh_id_token(self.user_data) or self.user_data.get("id_token", "")
+
+            # Keep users/{uid} in step too: with PAT_SYNC_TO_FIRESTORE on it is
+            # the copy that lets this account sign in on another PC, and it is
+            # what posts schedules saved by builds older than
+            # COPY_PAT_INTO_SCHEDULE. A failure here no longer affects the
+            # author, because the schedule carries its own token.
+            if PAT_SYNC_TO_FIRESTORE and pat:
+                if not _save_pat_remote(self.user_data.get("uid", ""), token, pat):
+                    logger.warning("users/%s.pat could not be updated",
+                                   self.user_data.get("uid", ""))
+
+            doc_id = _fs_create(SCHEDULED_COMMENTS_COLLECTION, token, values)
+            logger.info("Scheduled comment saved: doc=%s wi=%s due=%s",
+                        doc_id, self.work_item_id, self.due_at)
+            self.saved.emit(doc_id)
+        except Exception as e:
+            logger.exception("Could not save the scheduled comment")
+            self.failed.emit(str(e))
+
+
+class ScheduledCommentsListWorker(QThread):
+    """Reads this user's schedules back from Firestore."""
+    loaded = pyqtSignal(object)   # list of dicts
+    failed = pyqtSignal(str)
+
+    def __init__(self, user_data, parent=None):
+        super().__init__(parent)
+        self.user_data = user_data
+
+    def run(self):
+        try:
+            uid = self.user_data.get("uid", "")
+            if not uid:
+                self.failed.emit("Not signed in.")
+                return
+            token = _refresh_id_token(self.user_data) or self.user_data.get("id_token", "")
+            documents = _fs_query(
+                SCHEDULED_COMMENTS_COLLECTION, token,
+                field="owner_uid", value=uid, limit=200,
+            )
+            documents.sort(key=lambda d: str(d.get("due_at", "")), reverse=True)
+            self.loaded.emit(documents)
+        except Exception as e:
+            logger.exception("Could not load scheduled comments")
+            self.failed.emit(str(e))
+
+
+class ScheduledCommentDialog(QDialog):
+    """Compose a TFS comment now, have it posted at a chosen time.
+
+    The comment is stored in Firestore; scheduled_comment_worker.py on the
+    host posts it. Images go up as work item attachments straight away,
+    because the host has no access to this PC's disk.
+    """
+
+    def __init__(self, user_data, parent=None):
+        super().__init__(parent)
+        self.user_data = dict(user_data or {})
+        self.image_paths = []
+        self._documents = []
+        self._save_worker = None
+        self._list_worker = None
+
+        self.setWindowTitle("Scheduled Comment")
+        self.setObjectName("ScheduledComment")
+        self.setMinimumSize(980, 620)
+        self.setStyleSheet(self._style())
+
+        # Compose on the left, saved schedules down the right-hand side: the
+        # list is a reference you glance at while writing, not something to
+        # scroll past to reach the buttons.
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(18)
+
+        compose = QtWidgets.QVBoxLayout()
+        compose.setSpacing(10)
+
+        title = QtWidgets.QLabel("Schedule a TFS comment")
+        title.setStyleSheet("font-size: 20px; font-weight: 700;")
+        compose.addWidget(title)
+
+        subtitle = QtWidgets.QLabel(
+            "Saved in the cloud now; the hosted worker posts it to the work item "
+            "at the time you pick."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("font-size: 12px; color: #6b7280;")
+        compose.addWidget(subtitle)
+
+        form = QtWidgets.QFormLayout()
+        form.setSpacing(8)
+        form.setContentsMargins(0, 6, 0, 6)
+
+        self.work_item_input = QLineEdit()
+        self.work_item_input.setPlaceholderText("e.g. 123456")
+        self.work_item_input.setMaximumWidth(240)
+        form.addRow("Work Item ID:", self.work_item_input)
+
+        self.when_input = QtWidgets.QDateTimeEdit(
+            QtCore.QDateTime.currentDateTime().addSecs(600)
+        )
+        self.when_input.setCalendarPopup(True)
+        self.when_input.setDisplayFormat("MM/dd/yyyy hh:mm AP")
+        self.when_input.setMaximumWidth(240)
+        form.addRow("Post at (local time):", self.when_input)
+
+        compose.addLayout(form)
+
+        comment_label = QtWidgets.QLabel("Comment")
+        comment_label.setObjectName("sectionLabel")
+        compose.addWidget(comment_label)
+
+        self.body_input = CommentEditor(pat=self.user_data.get("pat", ""))
+        self.body_input.setPlaceholderText(
+            "Write the comment. '*' then space starts a bullet, '1.' then space a "
+            "numbered list, Ctrl+B / Ctrl+I / Ctrl+U set bold, italic and "
+            "underline, and a picture can be pasted straight in."
+        )
+        self.body_input.image_added.connect(self._on_pasted_image)
+        self.body_input.textChanged.connect(self._on_editor_changed)
+        compose.addWidget(self.body_input, stretch=1)
+
+        editor_hint = QtWidgets.QLabel(
+            "Ctrl+B bold  ·  Ctrl+I italic  ·  Ctrl+U underline  ·  "
+            "* then space = bullet  ·  1. then space = numbered"
+        )
+        editor_hint.setWordWrap(True)
+        editor_hint.setStyleSheet("font-size: 11px; color: #6b7280;")
+        compose.addWidget(editor_hint)
+
+        # Pictures are pasted into the box, not picked from a dialog: the box is
+        # the only place a picture can be positioned among the text.
+        self.images_label = QtWidgets.QLabel("No pictures pasted")
+        self.images_label.setStyleSheet("font-size: 12px; color: #6b7280;")
+        compose.addWidget(self.images_label)
+
+        self.author_label = QtWidgets.QLabel(
+            "This comment is posted as you: the worker uses the TFS token "
+            "stored with your account."
+        )
+        self.author_label.setWordWrap(True)
+        self.author_label.setStyleSheet("font-size: 12px; color: #6b7280;")
+        compose.addWidget(self.author_label)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.setContentsMargins(0, 6, 0, 0)
+        self.schedule_btn = QPushButton("Schedule Comment")
+        self.schedule_btn.clicked.connect(self.schedule)
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("ghost")
+        close_btn.clicked.connect(self.reject)
+        buttons.addWidget(self.schedule_btn)
+        buttons.addStretch()
+        buttons.addWidget(close_btn)
+        compose.addLayout(buttons)
+
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("font-size: 12px; color: #6b7280;")
+        compose.addWidget(self.status_label)
+
+        layout.addLayout(compose, stretch=1)
+
+        # --- saved schedules, as a panel down the right-hand side ---
+        side = QtWidgets.QFrame()
+        side.setObjectName("sidePanel")
+        side.setFixedWidth(320)
+        side_layout = QtWidgets.QVBoxLayout(side)
+        side_layout.setContentsMargins(16, 16, 16, 16)
+        side_layout.setSpacing(10)
+
+        side_header = QtWidgets.QHBoxLayout()
+        side_title = QtWidgets.QLabel("Scheduled")
+        side_title.setObjectName("sideTitle")
+        side_header.addWidget(side_title)
+        side_header.addStretch()
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setObjectName("ghost")
+        self.refresh_btn.clicked.connect(self.refresh_list)
+        side_header.addWidget(self.refresh_btn)
+        side_layout.addLayout(side_header)
+
+        self.list_view = QtWidgets.QListWidget()
+        self.list_view.setObjectName("scheduleList")
+        side_layout.addWidget(self.list_view, stretch=1)
+
+        # List messages belong to the list, not to the compose area.
+        self.list_status = QtWidgets.QLabel("")
+        self.list_status.setWordWrap(True)
+        self.list_status.setStyleSheet("font-size: 11.5px; color: #6b7280;")
+        side_layout.addWidget(self.list_status)
+
+        self.cancel_btn = QPushButton("Cancel selected")
+        self.cancel_btn.setObjectName("ghost")
+        self.cancel_btn.clicked.connect(self.cancel_selected)
+        side_layout.addWidget(self.cancel_btn)
+
+        layout.addWidget(side)
+
+        self.refresh_list()
+        self.showMaximized()
+
+    def _style(self):
+        """Same dark/light treatment as the rest of the app."""
+        if is_windows_dark_mode():
+            return """
+            QDialog#ScheduledComment {
+                background: #0f1923; color: #e6eef5;
+                font-family: Inter, Segoe UI, Arial;
+            }
+            QLabel { color: #e6eef5; }
+            QLabel#sectionLabel {
+                font-size: 11px; font-weight: 700; color: #98a0a6;
+            }
+            QLabel#sideTitle { font-size: 14px; font-weight: 700; }
+            QFrame#sidePanel {
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 14px;
+            }
+            QLineEdit, QTextEdit, QDateTimeEdit, QListWidget {
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 10px; padding: 8px;
+                color: #e6eef5; font-size: 13px;
+            }
+            QLineEdit:focus, QTextEdit:focus, QDateTimeEdit:focus {
+                border: 1px solid #ed3b3b;
+            }
+            QListWidget#scheduleList {
+                background: transparent; border: none; padding: 0px;
+            }
+            QListWidget#scheduleList::item {
+                padding: 7px 8px; border-radius: 8px; color: #c9d4de;
+            }
+            QListWidget#scheduleList::item:hover {
+                background: rgba(255,255,255,0.05);
+            }
+            QListWidget#scheduleList::item:selected {
+                background: rgba(237,59,59,0.20); color: #ffffff;
+            }
+            QPushButton {
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 #ed3b3b, stop:1 #c62e2e);
+                color: white; border-radius: 10px;
+                padding: 8px 16px; font-size: 13px; font-weight: 600;
+            }
+            QPushButton:hover { background: #c62e2e; }
+            QPushButton#ghost {
+                background: transparent;
+                border: 1px solid rgba(255,255,255,0.16);
+                color: #e6eef5; padding: 7px 14px;
+            }
+            QPushButton#ghost:hover { border-color: #ed3b3b; color: #ffffff; }
+            QPushButton:disabled {
+                background: rgba(255,255,255,0.08); color: #98a0a6;
+                border-color: transparent;
+            }
+            QPushButton#ghost:disabled {
+                background: transparent; color: #98a0a6;
+                border-color: rgba(255,255,255,0.08);
+            }
+            """
+        return """
+        QDialog#ScheduledComment {
+            background: #f5f7fa; color: #1f2933;
+            font-family: Inter, Segoe UI, Arial;
+        }
+        QLabel { color: #111827; }
+        QLabel#sectionLabel {
+            font-size: 11px; font-weight: 700; color: #6b7280;
+        }
+        QLabel#sideTitle { font-size: 14px; font-weight: 700; }
+        QFrame#sidePanel {
+            background: #ffffff; border: 1px solid #e5e7eb;
+            border-radius: 14px;
+        }
+        QLineEdit, QTextEdit, QDateTimeEdit, QListWidget {
+            background: white; border: 1px solid #d1d5db;
+            border-radius: 10px; padding: 8px;
+            color: #111827; font-size: 13px;
+        }
+        QLineEdit:focus, QTextEdit:focus, QDateTimeEdit:focus {
+            border: 1px solid #ed3b3b;
+        }
+        QListWidget#scheduleList {
+            background: transparent; border: none; padding: 0px;
+        }
+        QListWidget#scheduleList::item {
+            padding: 7px 8px; border-radius: 8px; color: #374151;
+        }
+        QListWidget#scheduleList::item:hover {
+            background: rgba(17,24,39,0.04);
+        }
+        QListWidget#scheduleList::item:selected {
+            background: rgba(237,59,59,0.12); color: #111827;
+        }
+        QPushButton {
+            background: #ed3b3b; color: white; border-radius: 10px;
+            padding: 8px 16px; font-size: 13px; font-weight: 600;
+        }
+        QPushButton:hover { background: #c62e2e; }
+        QPushButton#ghost {
+            background: transparent; border: 1px solid #d1d5db;
+            color: #374151; padding: 7px 14px;
+        }
+        QPushButton#ghost:hover { border-color: #ed3b3b; color: #ed3b3b; }
+        QPushButton:disabled { background: #d1d5db; color: #6b7280; }
+        QPushButton#ghost:disabled {
+            background: transparent; color: #9ca3af; border-color: #e5e7eb;
+        }
+        """
+
+    # --- compose ---
+
+    def clear_images(self):
+        self.image_paths = []
+        if _ui_alive(self.body_input):
+            self.body_input.clear_attachments()
+        self._update_images_label()
+
+    def _on_pasted_image(self, path):
+        """A picture pasted into the box is an attachment like any other."""
+        if path and path not in self.image_paths:
+            self.image_paths.append(path)
+            self._update_images_label()
+
+    def _on_editor_changed(self):
+        """Re-check the attachments once the edit that caused this is done.
+
+        Replacing a downloaded picture briefly removes it from the document,
+        so pruning immediately could drop an attachment that is still there.
+        """
+        QtCore.QTimer.singleShot(0, self._sync_pasted_images)
+
+    def _sync_pasted_images(self):
+        """Keep the attachments to the pictures still in the box.
+
+        There is no "Clear images" button any more, so deleting a picture is
+        how it is dropped: leaving its file attached would upload a picture the
+        comment no longer shows.
+        """
+        if not self.image_paths or not _ui_alive(self.body_input):
+            return
+        present = self.body_input.image_names()
+        kept = [p for p in self.image_paths if os.path.basename(p) in present]
+        if len(kept) != len(self.image_paths):
+            self.image_paths = kept
+            self._update_images_label()
+
+    def _update_images_label(self):
+        if not self.image_paths:
+            self.images_label.setText("No pictures pasted")
+            return
+        names = ", ".join(os.path.basename(p) for p in self.image_paths[:3])
+        extra = ""
+        if len(self.image_paths) > 3:
+            extra = f" +{len(self.image_paths) - 3} more"
+        self.images_label.setText(
+            f"{len(self.image_paths)} picture(s): {names}{extra}"
+        )
+
+    def schedule(self):
+        work_item_id = self.work_item_input.text().strip()
+        body = self.body_input.toPlainText().strip()
+
+        if not work_item_id.isdigit():
+            AppDialog("Validation Error", "Enter a numeric work item ID.", self).exec()
+            return
+        if not body and not self.image_paths:
+            AppDialog("Validation Error", "Write a comment or paste a picture first.", self).exec()
+            return
+        if not self.user_data.get("pat"):
+            AppDialog("Missing Token", "No TFS token on this PC. Sign in again to store one.", self).exec()
+            return
+
+        # The picker is local time; Firestore stores UTC so the worker can
+        # compare against its own clock wherever it runs.
+        local_text = self.when_input.dateTime().toString("yyyy-MM-ddTHH:mm:ss")
+        local_dt = datetime.strptime(local_text, "%Y-%m-%dT%H:%M:%S")
+        if local_dt < datetime.now():
+            AppDialog("Validation Error", "Pick a time in the future.", self).exec()
+            return
+        due_utc = local_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        self._set_busy(True)
+        self.status_label.setText("Uploading and saving...")
+
+        self._save_worker = ScheduleCommentWorker(
+            self.user_data, work_item_id, due_utc, body,
+            list(self.image_paths), self,
+            body_html=self.body_input.toHtml(),
+        )
+        self._save_worker.progress.connect(self.status_label.setText)
+        self._save_worker.saved.connect(self._on_saved)
+        self._save_worker.failed.connect(self._on_failed)
+        self._save_worker.start()
+
+    def _set_busy(self, busy):
+        for widget in (self.schedule_btn, self.refresh_btn, self.cancel_btn):
+            if _ui_alive(widget):
+                widget.setEnabled(not busy)
+        if _ui_alive(self.schedule_btn):
+            self.schedule_btn.setText("Saving..." if busy else "Schedule Comment")
+
+    def _on_saved(self, doc_id):
+        self._set_busy(False)
+        logger.info("Schedule stored: %s", doc_id)
+        self.status_label.setText(
+            "Scheduled. The worker will post it to the work item at that time."
+        )
+        self.body_input.clear()
+        self.clear_images()
+        self.refresh_list()
+
+    def _on_failed(self, message):
+        self._set_busy(False)
+        logger.warning("Scheduling failed: %s", message)
+        self.status_label.setText(f"Could not schedule: {message}")
+
+    # --- saved schedules ---
+
+    def refresh_list(self):
+        if not self.user_data.get("uid"):
+            self.list_status.setText("Not signed in.")
+            return
+        self.list_status.setText("Loading schedules...")
+        self._list_worker = ScheduledCommentsListWorker(self.user_data, self)
+        self._list_worker.loaded.connect(self._on_list_loaded)
+        self._list_worker.failed.connect(self._on_list_failed)
+        self._list_worker.start()
+
+    def _on_list_loaded(self, documents):
+        self._documents = documents or []
+        self.list_view.clear()
+        for doc in self._documents:
+            item = QtWidgets.QListWidgetItem(self._summary(doc))
+            item.setSizeHint(QtCore.QSize(0, 52))
+            self.list_view.addItem(item)
+        if not self._documents:
+            self.list_status.setText("No scheduled comments yet.")
+        else:
+            self.list_status.setText(f"{len(self._documents)} schedule(s)")
+
+    def _on_list_failed(self, message):
+        logger.warning("Could not load schedules: %s", message)
+        self.list_status.setText(f"Could not load schedules: {message}")
+
+    def _summary(self, doc):
+        """Ticket number and the time it goes out - nothing else.
+
+        A body preview made every row hard to scan; the panel is for spotting
+        which ticket is queued and when, not for reading the comments.
+        """
+        due = str(doc.get("due_at", ""))
+        try:
+            local = datetime.strptime(due, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            ).astimezone()
+            when = local.strftime("%m/%d/%Y %I:%M %p")
+        except (TypeError, ValueError):
+            when = due or "?"
+        return f"WI {doc.get('work_item_id', '?')}\n{when}"
+
+    def cancel_selected(self):
+        row = self.list_view.currentRow()
+        if row < 0 or row >= len(self._documents):
+            self.list_status.setText("Select a schedule to cancel.")
+            return
+
+        doc = self._documents[row]
+        if str(doc.get("status", "")) in ("sent", "sending"):
+            AppDialog(
+                "Cannot Cancel",
+                "That comment has already been sent or is being posted right now.",
+                self,
+            ).exec()
+            return
+
+        try:
+            token = _refresh_id_token(self.user_data) or self.user_data.get("id_token", "")
+            _fs_delete(SCHEDULED_COMMENTS_COLLECTION, doc.get("id", ""), token)
+            logger.info("Scheduled comment cancelled: %s", doc.get("id"))
+            self.list_status.setText("Schedule cancelled.")
+            self.refresh_list()
+        except Exception as e:
+            logger.exception("Could not cancel the schedule")
+            AppDialog("Error", f"Could not cancel: {e}", self).exec()
+
+    # --- lifetime ---
+
+    def _worker_running(self):
+        for worker in (self._save_worker, self._list_worker):
+            if worker is not None and worker.isRunning():
+                return True
+        return False
+
+    def reject(self):
+        """Closing mid-upload would destroy a running QThread."""
+        if self._worker_running():
+            self.status_label.setText("Still working - give it a second.")
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self._worker_running():
+            event.ignore()
+            self.status_label.setText("Still working - give it a second.")
+            return
+        super().closeEvent(event)
+
+
 class LoginWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -4099,7 +5460,8 @@ class LoginWindow(QtWidgets.QWidget):
             self.action_button.setText("Saving User Data...")
             QApplication.processEvents()
 
-            # The PAT never leaves this machine: it goes into the DPAPI store.
+            # Stored on this PC (DPAPI) and, when syncing is enabled, also in
+            # users/{uid} so the account can be used on another PC.
             if not _save_pat_local(uid, self.temp_pat):
                 logger.error("PAT could not be stored locally for uid=%s", uid)
                 self.action_button.setEnabled(True)
@@ -4111,6 +5473,8 @@ class LoginWindow(QtWidgets.QWidget):
                     self,
                 ).exec()
                 return
+
+            _save_pat_remote(uid, id_token, self.temp_pat)
 
             _update_profile(uid, id_token, {
                 "display_name": self.temp_display_name,
@@ -4780,6 +6144,14 @@ class LoginWindow(QtWidgets.QWidget):
         dialog = AyalaCheckerDialog(self)
         dialog.exec()
 
+    def run_scheduled_comment(self):
+        """Scheduled Comment - compose now, posted to TFS by the hosted worker."""
+        user_data = getattr(self, "current_user", None)
+        if not user_data:
+            AppDialog("Not Signed In", "Sign in before scheduling a comment.", self).exec()
+            return
+        ScheduledCommentDialog(user_data, self).exec()
+
     def run_tool_3(self):
         """Tool 3 — TODO: implement"""
         AppDialog("Tool 3", "Tool 3 is not yet implemented.", self).exec()
@@ -4927,8 +6299,8 @@ class LoginWindow(QtWidgets.QWidget):
         self.show_main_menu_page()
 
     def _on_login_needs_pat(self, pending):
-        """No PAT on this machine - a new PC, or the credential file was lost.
-        Ask once and keep it locally instead of in the shared database."""
+        """No PAT anywhere - a brand-new account, or one created before syncing
+        was enabled. Ask once, keep it locally, and publish it to users/{uid}."""
         if not _ui_alive(getattr(self, "login_btn", None)):
             return
         self._reset_login_button()
@@ -4943,6 +6315,7 @@ class LoginWindow(QtWidgets.QWidget):
         if not _save_pat_local(pending.get("uid", ""), pat.strip()):
             AppDialog("Error", "The PAT could not be stored securely on this PC.", self).exec()
             return
+        _save_pat_remote(pending.get("uid", ""), pending.get("id_token", ""), pat.strip())
         pending["pat"] = pat.strip()
         self._on_login_succeeded(pending)
 

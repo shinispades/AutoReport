@@ -5,6 +5,9 @@ serviceAccountKey.json
 # Runtime output
 report_log.txt
 
+# Worker configuration: holds FIREBASE_PASSWORD and TFS_PAT once filled in
+.env
+
 # Updater working files: _prev/ holds a copy of the previous build
 _update_swap.bat
 _update_trial.json

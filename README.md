@@ -14,6 +14,10 @@ and turns that into the paperwork the team files back into TFS:
 - **Ayala Checker** - reconciles a folder of hourly sales CSVs against the EOD
   CSV and writes an Excel workbook.
 - **Missing Sales Generator** - produces the diagnostic SQL / helper script.
+- **Scheduled Comment** - writes a TFS comment (text, links, images), stores it
+  in Firestore, and `scheduled_comment_worker.py` on an always-on host posts it
+  to the ticket at the time you picked. See
+  [Scheduled comments](#scheduled-comments-worker-on-a-host).
 - Tools 3-10 are registered but unimplemented (they pop "not yet implemented").
 
 Everything lives in a single `report.py`; there is no package layout.
@@ -93,10 +97,12 @@ The app updates itself from GitHub Releases on
 
 1. Bump `APP_VERSION` in `report.py`. The updater compares dotted numbers, so
    the tag must be strictly greater than the running version.
-2. Build and package, e.g.
-   `pyinstaller --noconfirm --windowed --icon asset/app.ico report.py`, then
-   zip the `dist` folder. **Zip is preferred** - it is extracted in place and
-   the app restarts itself. `.exe` assets are launched as an installer.
+2. Run `build.bat`. It creates `.venv`, installs the pinned requirements and
+   PyInstaller, freezes `report.py` into `dist\Report.exe` (direct
+   `pyinstaller --onefile` call, no spec to maintain) and copies the templates
+   and `asset\` next to the exe. Then zip the `dist` folder. **Zip is
+   preferred** - it is extracted in place and the app restarts itself. `.exe`
+   assets are launched as an installer.
 3. Publish a release whose tag matches (`v3.0.8.6` for `APP_VERSION = "3.0.8.6"`)
    with the zip attached.
 
@@ -129,6 +135,238 @@ app. The next start logs it; the staged `.new` file is kept, not deleted.
 `_prev/` holds one generation back and is refreshed on each update, so expect
 it to use roughly the size of the app directory.
 
+## Scheduled comments (worker on a host)
+
+The **Scheduled Comment** tool writes a comment now and has it posted to the
+ticket later. Two pieces are involved:
+
+| Piece | Runs on | Needs |
+| --- | --- | --- |
+| `Scheduled Comment` tool inside `report.py` | your PC | nothing extra |
+| `scheduled_comment_worker.py` | an always-on host | Python 3.11+, `requests` only |
+
+The worker deliberately does not import `report.py`: that module needs PyQt6,
+`winreg` and DPAPI, none of which exist in a Linux container.
+
+### How a comment gets posted
+
+1. You pick a work item, a local date/time and write the comment.
+2. Any images are uploaded straight away as **work item attachments**, and the
+   comment references their URLs. The host cannot read your disk, and an
+   attachment URL keeps working however late the comment is posted.
+
+### Writing the comment
+
+The box behaves like Word rather than a plain text field:
+
+| Type | Result |
+| --- | --- |
+| `*` or `-` + space at the start of a line | starts a bulleted list |
+| `1.` (or `1)`) + space | starts a numbered list |
+| Ctrl+B / Ctrl+I / Ctrl+U | bold / italic / underline for the selection or what is typed next |
+| Ctrl+V with a picture on the clipboard | the picture is inserted and attached to the comment |
+
+Enter on an empty list item ends the list, as in Word. Bare URLs are still
+turned into links automatically.
+
+The editor is rich text, so what TFS receives is real `<b>`, `<i>`, `<u>`,
+`<ul>`/`<ol>` markup rather than Markdown. A picture pasted into the box is
+written to a temp PNG under the system temp folder and uploaded as an
+attachment when the schedule is saved.
+
+A comment copied out of TFS is different: its pictures arrive as
+`<img src="https://tfs/.../_apis/wit/attachments/...">`, URLs rather than
+bytes, and Qt cannot load them (they need your token), so it draws an empty
+box. The editor therefore downloads each one in the background with your PAT -
+sent **only** when the picture's host matches `TFS_ORG_URL` - and swaps it into
+the box, so it is visible while you write and is uploaded with the comment.
+If a download fails, the URL is left in place and TFS still renders the
+picture from the original attachment.
+
+Only a fixed tag set (paragraphs, lists, `b`/`strong`, `i`/`em`, `u`, `s`,
+`code`, links, `img` with an http(s) source) survives into the stored HTML, so
+pasting from a browser or Word cannot inject scripts, styles or `<iframe>`s.
+
+3. The comment lands in the `scheduledComments` Firestore collection with
+   `status: pending` and a UTC `due_at`.
+4. The worker polls every `POLL_SECONDS` (default 30), claims each due document
+   with a compare-and-set write (so two instances can never post twice), posts
+   it to `POST .../_apis/wit/workItems/{id}/comments`, then marks it `sent` or
+   `failed` after `MAX_ATTEMPTS` tries.
+5. The comment is authored with the **scheduling user's PAT**, which the app
+   stores in the schedule document itself (`scheduledComments/{id}.pat`), so
+   it appears under their name. Schedules saved by older builds have no `pat`
+   field, and the worker then reads `users/{uid}` instead. The worker's own
+   `TFS_PAT` is only used when `TFS_ALLOW_SHARED_PAT=1` is set, because it
+   credits whoever owns that token.
+
+### Deploying the worker
+
+A Discord bot host such as bot-hosting.net is just a container running one
+long-lived process - no Discord token is involved. Any small Linux host works
+the same way.
+
+1. Create a **dedicated Firebase account** for the worker (e.g.
+   `scheduler@yourcompany.com`). It has to read every user's pending
+   schedules, so it must not be a person's account.
+2. Upload `scheduled_comment_worker.py` and `requirements-worker.txt`, then
+   `pip install -r requirements-worker.txt`.
+3. Set the environment variables in the host's startup/env settings:
+
+   | Variable | Meaning |
+   | --- | --- |
+   | `FIREBASE_EMAIL` | the worker account's email |
+   | `FIREBASE_PASSWORD` | its password |
+   | `TFS_PAT` | fallback PAT, used only when the schedule's author has none |
+   | `TFS_ORG_URL` | optional, defaults to the WebPOS collection |
+   | `POLL_SECONDS` | optional, default `30` |
+   | `MAX_ATTEMPTS` | optional, default `3` |
+   | `TFS_STRICT_AUTHOR` | optional, `1` refuses to post a comment that would appear under an account other than the person who scheduled it |
+   | `TFS_ALLOW_SHARED_PAT` | optional, `1` allows `TFS_PAT` to be used for schedules that carry no token of their own (default off) |
+
+   The panel only passes the variables it defines - a `.env` file is not read
+   by the container. The worker therefore loads a `.env` placed next to itself
+   (or in the working directory) on startup, so either route works. Real
+   environment variables win over the file.
+
+4. Start it with `python scheduled_comment_worker.py`. `--once` posts whatever
+   is due and exits, which is the quickest way to check the setup.
+5. Add rules for the collection in Firestore:
+
+   ```
+   match /scheduledComments/{docId} {
+     // Owner or worker only: each schedule carries the author's PAT.
+     allow read: if request.auth != null
+                 && (resource.data.owner_uid == request.auth.uid
+                     || request.auth.uid == "THE_WORKER_UID");
+     allow create: if request.auth != null
+                   && request.resource.data.owner_uid == request.auth.uid;
+     allow update: if request.auth != null
+                   && (resource.data.owner_uid == request.auth.uid
+                       || request.auth.uid == "THE_WORKER_UID"
+                       || resource.data.status in ["pending", "sending"]);
+     allow delete: if request.auth != null
+                   && resource.data.owner_uid == request.auth.uid;
+   }
+
+   match /users/{uid} {
+     // Each person reads and writes their own profile, as before.
+     allow read, write: if request.auth != null && request.auth.uid == uid;
+     // Optional. Only needed for schedules saved before COPY_PAT_INTO_SCHEDULE,
+     // which carry no token of their own: without it those comments cannot be
+     // posted as their author.
+     allow read: if request.auth != null
+                 && request.auth.uid == "THE_WORKER_UID";
+   }
+   ```
+
+   The worker writes to documents it does not own, which is what the
+   `request.auth.uid == "THE_WORKER_UID"` clause is for - replace it with the
+   worker account's uid, or drop the clause and rely on the status check
+   (broader: any signed-in user could then claim a pending schedule).
+   The status list must include `"sending"`, not only `"pending"`: the worker
+   first claims a document as `sending`, and without that the later `sent`
+   write is denied - the comment posts but the schedule is retried later, and
+   the ticket gets a duplicate.
+
+   The `match /users/{uid}` block above is the existing one with a single line
+   added; keep your current version and only add the second `allow read` if you
+   still have schedules saved by an older build. The `scheduledComments` block
+   matters either way: restricting `read` to the owner and the worker is what
+   keeps each copied PAT private now that schedules carry one.
+
+   The new `match` block must sit at the **top level** of the rules document,
+   next to `match /users/{uid}`. Paste it *inside* that block and the real path
+   becomes `users/{uid}/scheduledComments/...`, so every save is denied with
+   "The database refused the request". Press **Publish** after editing -
+   unsaved rules in the console are not in effect.
+
+No composite Firestore index is needed: the app queries on `owner_uid`, the
+worker on `status`, and the time filtering/ordering happens in Python.
+
+### The comment appears as the wrong person
+
+A TFS comment is authored by **whoever owns the PAT** used to post it - nothing
+in the comment payload can change that. The worker picks a token in this order:
+
+1. `pat` stored inside the schedule - written by the app when `COPY_PAT_INTO_SCHEDULE`
+   is on, which is the case that always gives you the right author,
+2. `users/{owner_uid}.pat` - schedules saved by older builds, and the copy
+   that also lets the account sign in on another PC,
+3. the worker's `TFS_PAT`, whose owner then gets credited - only with
+   `TFS_ALLOW_SHARED_PAT=1`. Without it the schedule is left `pending` rather
+   than posted under the wrong name.
+
+So a comment under the `TFS_PAT` owner means step 1 and step 2 both came up
+empty. The worker log says which one:
+
+| Log line | Cause | Fix |
+| --- | --- | --- |
+| `Firestore refused users/... (403)` | the `users/{uid}` rule does not let the worker account read other people's documents (or `THE_WORKER_UID` in the rules was never replaced with the real uid) | add the second `allow read` from the rules block above, or re-save the schedule with `COPY_PAT_INTO_SCHEDULE` on |
+| `NOT posting - no PAT stored for ...` | the schedule has no `pat` field (saved by a build older than `COPY_PAT_INTO_SCHEDULE`) and the worker could read nothing from `users/{uid}` | re-save the schedule in the current app |
+| `WARNING ... owns the token used, but ... scheduled it` | the token found belongs to somebody else (a shared personal token handed round the team, or the wrong token copied into `users/{uid}`) | give each person their own TFS PAT |
+| `WARNING TFS recorded ... as the author, not the scheduler` | the comment was posted and TFS recorded a different account - this is the definitive check | the PAT in `scheduledComments/{id}.pat` belongs to the wrong person |
+
+Run the worker with `--check` to see this without posting anything:
+
+```bash
+python scheduled_comment_worker.py --check
+```
+
+It signs in, lists every pending/sending schedule with its author, the token
+that would be used and the TFS account that token belongs to, and posts
+nothing. It is safe on the live host while the worker is running.
+
+The account lookup uses `_apis/connectionData`, which older on-premises TFS
+installations answer only without an `api-version` or with an old one, so the
+worker tries no version first and then a descending list. If the server
+answers none of them (`Could not resolve a token's TFS account (...)`), the
+worker still posts, and reports the author from the `createdBy` field of the
+reply to its own comment POST - `posted as <account>`. That reply is the
+recorded truth, so a wrong author is reported even when the lookup fails.
+
+Every real post also logs `comment will appear as <account>`, so a wrong author
+is visible even when `--check` is not run.
+
+By default the worker will not post a comment as the wrong person: a schedule
+whose author's token it cannot find stays `pending` (with the reason in
+`last_error`) and is retried every poll, so it goes out by itself once the
+token is there. `TFS_STRICT_AUTHOR=1` adds the same block for the case where a
+token *was* found but belongs to somebody else.
+
+Note that the worker's own `FIREBASE_EMAIL` is irrelevant to the author: the
+worker can sign in as any account (even a person's) and the comment still
+carries the author's PAT. Use a dedicated worker account anyway, so revoking
+it does not disturb a person's sign-in.
+
+### Things to know
+
+- The comment is authored by the **person who scheduled it**: the app copies
+  their PAT into the schedule document, and the worker posts with it. That
+  removes any dependency on the worker being allowed to read `users/{uid}` - a
+  permission that is easy to get wrong and used to fail silently.
+- A comment the worker cannot attribute to its author is **not** posted, so a
+  ticket can no longer quietly receive a comment under the wrong name. The
+  schedule waits in `pending` with the reason in `last_error`.
+- **Where the PAT lives.** The app keeps it DPAPI-encrypted under
+  `%LOCALAPPDATA%\AutoReport\credentials\` and, because `PAT_SYNC_TO_FIRESTORE`
+  is on in `report.py`, also mirrors it into the user's own `users/{uid}`
+  document. That second copy is what lets the same account sign in on another
+  PC without re-entering the token, but it is plain text in Firestore: its only
+  protection is the owner-only `users/{uid}` rule and whatever guards the
+  project. Set `PAT_SYNC_TO_FIRESTORE = False` to keep the PAT on each machine
+  only, at the cost of one prompt per new PC.
+- Free hosts restart containers. Claims are atomic and attempts are counted, and
+  a schedule left on `sending` by a restart is retried after 10 minutes, so a
+  restart cannot silently swallow a comment - but run **one** worker instance.
+- Cancelling a schedule after its images were uploaded leaves the attachments
+  on the work item. An unused attachment is harmless; TFS has no cheap "delete
+  orphan attachment" call.
+- If the host is asleep at the scheduled moment, the comment goes out on the
+  first poll after it wakes. The schedule is "no earlier than", not exact.
+- The worker's PAT needs work item read/write on the project - a comment is a
+  work item write.
+
 ## Security notes
 
 - **`serviceAccountKey.json` is a master key for the whole Firestore database.**
@@ -137,6 +375,14 @@ it to use roughly the size of the app directory.
   access token, which is stored in plaintext. Keep the file out of git (see
   `.gitignore`) and treat any leaked copy as a full database compromise: rotate
   the key in the Firebase console.
+- **Every** scheduled comment now stores the author's PAT in its document
+  (`COPY_PAT_INTO_SCHEDULE`), because the hosted worker has no other way to
+  post it as that person. The token is plain text in Firestore: its only
+  protection is the `read` rule on `scheduledComments`, which is why the rules
+  above limit reads to the owner and the worker. Anyone who can read the whole
+  collection is holding everybody's token.
+- Scoped, per-person PATs matter more now than they did: a token kept in
+  Firestore should not be able to do anything except comment on work items.
 - PATs should be scoped to the minimum work-item permissions the tool needs,
   and rotated on the schedule shown on the Settings page.
 - `report_log.txt` records emails, ticket IDs and ticket titles in plaintext.

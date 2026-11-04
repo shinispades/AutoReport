@@ -1,0 +1,7 @@
+# AutoReport - dependencies for scheduled_comment_worker.py
+#
+# The worker runs on a small Linux container (bot-hosting.net or similar), so
+# it must not pull in PyQt6, pywin32 or anything else the desktop app needs.
+# Install with:  pip install -r requirements-worker.txt
+
+requests==2.32.3
