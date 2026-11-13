@@ -191,14 +191,68 @@ pasting from a browser or Word cannot inject scripts, styles or `<iframe>`s.
    `status: pending` and a UTC `due_at`.
 4. The worker polls every `POLL_SECONDS` (default 30), claims each due document
    with a compare-and-set write (so two instances can never post twice), posts
-   it to `POST .../_apis/wit/workItems/{id}/comments`, then marks it `sent` or
-   `failed` after `MAX_ATTEMPTS` tries.
+   it to `POST <project>/_apis/wit/workItems/{id}/comments`, then marks it
+   `sent` or `failed` after `MAX_ATTEMPTS` tries.
 5. The comment is authored with the **scheduling user's PAT**, which the app
    stores in the schedule document itself (`scheduledComments/{id}.pat`), so
    it appears under their name. Schedules saved by older builds have no `pat`
    field, and the worker then reads `users/{uid}` instead. The worker's own
    `TFS_PAT` is only used when `TFS_ALLOW_SHARED_PAT=1` is set, because it
    credits whoever owns that token.
+
+### Which project a comment goes to
+
+The **Project** picker in the dialog offers every entry in `TFS_TARGETS`
+(`report.py`):
+
+| Label | Project URL |
+| --- | --- |
+| `WebPOS` | `https://tfs.alliancewebpos.com/tfs/WebPOSCollection/WebPOS` |
+| `WPS` | `https://tfs.alliancewebpos.com/tfs/WPSCollection/WPS` |
+
+The chosen URL is stored on the schedule as `tfs_org_url` (with the label in
+`tfs_target`), and the worker posts to that project. Images are uploaded to the
+same project at compose time. Schedules saved by older builds carry no URL and
+go to the worker's `TFS_ORG_URL`.
+
+Add a project in two places: the `TFS_TARGETS` list in `report.py` and the
+`TFS_TARGETS` dict in `scheduled_comment_worker.py`. The worker **refuses** a
+schedule whose URL is not in its own list - a schedule carries a person's PAT,
+so an unchecked URL would be a way to send that token to another server.
+
+### Is the worker online?
+
+A bot host usually exposes no public HTTP port, so the dialog cannot ping the
+worker directly. The worker instead writes a heartbeat document on every poll:
+
+```
+workerStatus/<WORKER_ID>  ->  last_seen, started_at, host, version,
+                              projects, pending, poll_seconds
+```
+
+The **Scheduled Comment** dialog reads the newest heartbeat on open, every 30
+seconds, and when **Check** is pressed, and shows one of:
+
+- **Worker online** - heartbeat within `WORKER_ONLINE_SECONDS` (120s), with the
+  projects it serves and how long ago it was last seen.
+- **Worker offline** - a heartbeat exists but is older than that. Scheduling is
+  still allowed after a confirmation, because the comment will post when a
+  worker comes back; the point is that nothing posts it right now.
+- **Worker status unknown** - no heartbeat has been written yet, or the
+  `workerStatus` read was denied. Check the worker log and the rules below.
+
+Each worker needs its own `WORKER_ID` (default: the hostname) so two workers do
+not overwrite each other's heartbeat. A missing heartbeat never stops comments
+from being posted - it only affects what the app displays.
+
+If the label reads "could not check ... Missing or insufficient permissions",
+the published rules have no `workerStatus` block yet (or it is nested inside
+another `match`). That is a rules problem, not a worker problem: the worker may
+be running fine and posting comments while the app is still refused. Add the
+block from step 5 below, press **Publish**, and press **Check** again. The
+worker logs `Signed in as ... (uid ...)` on startup - that uid is what
+`THE_WORKER_UID` must be replaced with, and the same log prints a heartbeat
+warning if the worker's *write* is denied as well.
 
 ### Deploying the worker
 
@@ -218,7 +272,8 @@ the same way.
    | `FIREBASE_EMAIL` | the worker account's email |
    | `FIREBASE_PASSWORD` | its password |
    | `TFS_PAT` | fallback PAT, used only when the schedule's author has none |
-   | `TFS_ORG_URL` | optional, defaults to the WebPOS collection |
+   | `TFS_ORG_URL` | optional fallback project URL for schedules saved without one, defaults to WebPOS |
+   | `WORKER_ID` | optional name this worker's heartbeat is written under, default: the hostname |
    | `POLL_SECONDS` | optional, default `30` |
    | `MAX_ATTEMPTS` | optional, default `3` |
    | `TFS_STRICT_AUTHOR` | optional, `1` refuses to post a comment that would appear under an account other than the person who scheduled it |
@@ -247,6 +302,14 @@ the same way.
                        || resource.data.status in ["pending", "sending"]);
      allow delete: if request.auth != null
                    && resource.data.owner_uid == request.auth.uid;
+   }
+
+   match /workerStatus/{docId} {
+     // The app shows the worker as online/offline from these documents, so any
+     // signed-in user reads them; only worker accounts may write.
+     allow read: if request.auth != null;
+     allow write: if request.auth != null
+                  && request.auth.uid == "THE_WORKER_UID";
    }
 
    match /users/{uid} {
@@ -338,6 +401,52 @@ Note that the worker's own `FIREBASE_EMAIL` is irrelevant to the author: the
 worker can sign in as any account (even a person's) and the comment still
 carries the author's PAT. Use a dedicated worker account anyway, so revoking
 it does not disturb a person's sign-in.
+
+### `TFS rejected the PAT (401)`
+
+TFS never saw a token it accepts, so nothing was posted. The schedule holds a
+**copy** of the author's PAT taken when it was saved (`scheduledComments/{id}.pat`),
+which means a token that is valid in the app today can still be dead in a
+schedule saved last month: PATs expire, and regenerating one invalidates the
+old value everywhere it was copied.
+
+Check the token against the project before changing anything else:
+
+```bash
+# the collection root - a 401 here means the token itself is bad for this server
+curl -s -o /dev/null -w "%{http_code}\n" \
+     -u :<PAT> https://tfs.alliancewebpos.com/tfs/WPSCollection/_apis/connectionData
+
+# the project - a 401 here with 200 above means no access to that project
+curl -s -o /dev/null -w "%{http_code}\n" \
+     -u :<PAT> "https://tfs.alliancewebpos.com/tfs/WPSCollection/WPS/_apis/wit/workitems/1?api-version=7.0"
+```
+
+| Result | Meaning | Fix |
+| --- | --- | --- |
+| 401 on both | the PAT is expired, revoked, scoped to a different server, **or its account has no access to that collection** - on-premises TFS answers 401, not 403, for an identity that is not a member of the collection | check the token works elsewhere on the same server (a WebPOS schedule posting fine proves the token is alive), then add the account to the collection/project team or issue a PAT from an account that is in it |
+| 200 on the collection, 401 on the project | the token is valid but that account has no work-item access to `WPS` | add the account to the project team, and check the PAT's scopes include Work Items (read & write) |
+| 404 on the collection root | `WPSCollection` is not the collection's name/path on this server | fix the URL in `TFS_TARGETS` in both `report.py` and the worker |
+
+The retry log now names the URL and keeps every candidate's status, e.g.
+`the token was rejected (401)` for both the collection and the project, or a
+404 for the collection followed by a 401 for the project. After `MAX_ATTEMPTS`
+the schedule is marked `failed` with the same text in `last_error`, which is
+what the app lists - nothing is retried behind your back.
+
+A 401 at the **collection root** (`/tfs/<Collection>/_apis/connectionData`)
+means the server never accepted the token, so the project URL and the
+`TFS_TARGETS` entry are not implicated. Compare two schedules by the token
+fingerprint the worker prints:
+
+```
+... (WI 50101 WebPOS): posting with the PAT stored with the schedule [token sha 3f9c1a2b (52 chars)]
+... (WI 5510 WPS): posting with the PAT stored with the schedule [token sha 7d20e4f1 (52 chars)]
+```
+
+Same fingerprint and WPS still 401s - the account lacks access to that
+collection. Different fingerprints - the failing schedule is holding a
+different (older or other person's) token; re-save it in the app.
 
 ### Things to know
 

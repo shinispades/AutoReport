@@ -15,7 +15,9 @@ Configuration (environment variables, set them in the host's panel):
     FIREBASE_PASSWORD   its password
     TFS_PAT             fallback PAT, used only when the person who scheduled
                         a comment has no token in users/{uid}
-    TFS_ORG_URL         default: the WebPOS project collection
+    TFS_ORG_URL         fallback project URL for schedules that carry none
+                        (older builds); default: WebPOS
+    WORKER_ID           name this worker reports under (default: hostname)
     POLL_SECONDS        how often to look for due comments (default 30)
     MAX_ATTEMPTS        give up on a comment after this many tries (default 3)
     TFS_STRICT_AUTHOR   set to 1 to refuse to post a comment whose author
@@ -31,6 +33,15 @@ Run once to test, then leave it running:
     python scheduled_comment_worker.py --once
     python scheduled_comment_worker.py
 
+A schedule may target any of the projects in TFS_TARGETS below. The app writes
+the project URL into the schedule (`tfs_org_url`) and this worker refuses any
+URL outside that list - the schedule carries a person's PAT, so an unvetted
+URL would be a way to send that token to another server.
+
+Each poll also writes a heartbeat document to `workerStatus/{WORKER_ID}`, which
+is how the desktop app tells the user whether a worker is actually running
+before it lets them schedule a comment.
+
 A comment is authored by whoever owns the PAT used to post it. When the
 comment shows the wrong name, run --check on the host: it reports, for every
 pending schedule, which PAT would be used and which TFS account that PAT
@@ -38,6 +49,9 @@ belongs to.
 """
 
 import os
+import hashlib
+import re
+import socket
 import sys
 import time
 import traceback
@@ -59,6 +73,19 @@ DOCUMENTS_API = (
 COLLECTION = "scheduledComments"
 USERS_COLLECTION = "users"
 DEFAULT_ORG_URL = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection/WebPOS"
+
+# Projects a schedule may name. The app shows these labels and writes the
+# matching URL into the schedule; anything else is refused below instead of
+# being sent the author's token.
+TFS_TARGETS = {
+    "WebPOS": "https://tfs.alliancewebpos.com/tfs/WebPOSCollection/WebPOS",
+    "WPS": "https://tfs.alliancewebpos.com/tfs/WPSCollection/WPS",
+}
+
+# Where the heartbeat goes: one document per worker, read by the desktop app.
+STATUS_COLLECTION = "workerStatus"
+WORKER_VERSION = "1.0"
+
 COMMENT_API_VERSION = "5.1-preview.3"
 
 # connectionData takes no api-version at all on most servers, and refuses one
@@ -159,6 +186,10 @@ def now_iso():
     return utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Reported in the heartbeat, so "last seen" can be read next to "running since".
+STARTED_AT = now_iso()
+
+
 # ================= FIREBASE AUTH =================
 
 # Plain-English meaning of the Identity Toolkit error codes, so the host's
@@ -206,7 +237,9 @@ def sign_in(email, password):
             f"Firebase sign-in failed ({resp.status_code}): {detail} - {hint}"
         )
     data = resp.json()
-    log(f"Signed in as {email}")
+    # The uid is what the scheduledComments/workerStatus rules need for
+    # THE_WORKER_UID; printing it saves hunting through the Auth console.
+    log(f"Signed in as {email} (uid {data.get('localId', 'unknown')})")
     return data.get("idToken", ""), data.get("refreshToken", "")
 
 
@@ -340,6 +373,36 @@ def fetch_user_pat(id_token, uid):
     return (data.get("pat") or "").strip()
 
 
+def normalise_org_url(url):
+    """Compare project URLs without caring about case or a trailing slash."""
+    return (url or "").strip().rstrip("/").lower()
+
+
+def target_url(doc):
+    """The project URL this schedule must be posted to, or "" when refused.
+
+    Schedules saved by older builds have no `tfs_org_url`, so those fall back
+    to the worker's default. A URL that is not one of TFS_TARGETS is refused:
+    the document carries the author's PAT, and posting it to a host the worker
+    was not configured for would hand that token to that host.
+    """
+    wanted = normalise_org_url(doc.get("tfs_org_url"))
+    if not wanted:
+        return DEFAULT_ORG_URL
+    for known in TFS_TARGETS.values():
+        if normalise_org_url(known) == wanted:
+            return known
+    return ""
+
+
+def target_label(doc, url):
+    """Human name for a project URL - the schedule's own label when it has one."""
+    for label, known in TFS_TARGETS.items():
+        if normalise_org_url(known) == normalise_org_url(url):
+            return label
+    return (doc.get("tfs_target") or url.rsplit("/", 1)[-1]).strip()
+
+
 def pat_identity(pat, org_url):
     """The TFS account a PAT belongs to - which is the author of the comment.
 
@@ -360,7 +423,10 @@ def pat_identity(pat, org_url):
             return cached[1]
 
     identity = ""
-    problem = ""
+    # Every candidate is recorded, not just the last one: a 404 on the
+    # collection root followed by a 401 on the project URL is a different
+    # problem from two 401s, and only the list tells them apart.
+    problems = []
     for base in connection_candidates(org_url):
         for version in CONNECTION_API_VERSIONS:
             params = {} if version is None else {"api-version": version}
@@ -372,19 +438,19 @@ def pat_identity(pat, org_url):
                     timeout=HTTP_TIMEOUT,
                 )
             except requests.RequestException as e:
-                problem = f"{base}: {e}"
+                problems.append(f"{base}: {e}")
                 break                     # network is down, versions will not help
             if resp.status_code == 401:
-                problem = f"{base}: the token was rejected (401)"
+                problems.append(f"{base}: the token was rejected (401)")
                 break
             if resp.status_code >= 400:
-                problem = (f"{base}: HTTP {resp.status_code} "
-                           f"(api-version {version or 'none'})")
+                problems.append(f"{base}: HTTP {resp.status_code} "
+                                f"(api-version {version or 'none'})")
                 continue
             try:
                 user = (resp.json() or {}).get("authenticatedUser") or {}
             except ValueError:
-                problem = f"{base}: the reply was not JSON"
+                problems.append(f"{base}: the reply was not JSON")
                 continue
             unique_name = (user.get("uniqueName") or "").strip()
             if unique_name:
@@ -399,8 +465,9 @@ def pat_identity(pat, org_url):
     if not identity:
         # Not fatal: the comment is still posted, and the author is confirmed
         # from the reply TFS sends back for it (see comment_author()).
-        log(f"Could not resolve a token's TFS account ({problem or 'no answer'}) "
-            "- posting anyway; the author is checked on the posted comment")
+        log(f"Could not resolve a token's TFS account "
+            f"({'; '.join(problems) or 'no answer'}) - posting anyway; the "
+            "author is checked on the posted comment")
 
     _identity_cache[pat] = (now, identity)
     return identity
@@ -423,11 +490,25 @@ def connection_candidates(org_url):
     return list(reversed(candidates))
 
 
+def account_key(name):
+    """The bare account name from any of the spellings TFS uses.
+
+    On-premises TFS reports `SMB01\\jbarrientos` while the schedule carries
+    `jbarrientos@asi-dev1.com`; a literal comparison of the two would flag
+    every on-prem comment as a wrong author. Strip the domain first, then the
+    address suffix, so both reduce to `jbarrientos`.
+    """
+    key = (name or "").strip().lower()
+    key = key.rsplit("\\", 1)[-1]
+    return key.split("@", 1)[0]
+
+
 def author_matches(identity, owner_email):
     """True when the token owner is the person the schedule says it is.
 
-    Compared case-insensitively, and also on the address alone, because TFS
-    sometimes reports a different domain spelling for the same account.
+    Compared case-insensitively, and also on the account name alone, because
+    TFS reports the same person as `domain\\user`, `user@domain` or `user`
+    depending on the collection.
     """
     if not identity or not owner_email:
         return True          # nothing to compare - do not block on a guess
@@ -435,7 +516,20 @@ def author_matches(identity, owner_email):
     owner = owner_email.strip().lower()
     if unique_name == owner:
         return True
-    return unique_name.split("@", 1)[0] == owner.split("@", 1)[0]
+    return account_key(unique_name) == account_key(owner)
+
+
+def token_fingerprint(pat):
+    """Identify a token without printing it.
+
+    Two schedules that fail differently can be compared from the log: the same
+    fingerprint means the same PAT (so a 401 is about access), a different one
+    means the schedule is carrying an older or foreign token.
+    """
+    if not pat:
+        return "no token"
+    digest = hashlib.sha256(pat.strip().encode("utf-8")).hexdigest()[:8]
+    return f"sha {digest} ({len(pat)} chars)"
 
 
 def resolve_pat(id_token, doc, shared_pat):
@@ -456,6 +550,63 @@ def resolve_pat(id_token, doc, shared_pat):
         pat = shared_pat
         source = "the shared TFS_PAT"
     return owner_uid, pat, source
+
+
+def worker_id():
+    """Document id for this worker's heartbeat (Firestore ids allow no '/')."""
+    raw = (os.environ.get("WORKER_ID") or socket.gethostname() or "worker").strip()
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-")
+    return (cleaned or "worker")[:60]
+
+
+_status_warning_shown = False
+
+
+def write_heartbeat(id_token, poll_seconds, pending):
+    """Tell the app this worker is alive and which projects it serves.
+
+    PATCH creates the document when it does not exist, so there is nothing to
+    set up in the console. A rules problem is logged once and then ignored: a
+    missing heartbeat must never stop comments from being posted.
+    """
+    global _status_warning_shown
+
+    values = {
+        "worker_id": worker_id(),
+        "status": "online",
+        "host": socket.gethostname(),
+        "version": WORKER_VERSION,
+        "projects": ", ".join(TFS_TARGETS),
+        "poll_seconds": int(poll_seconds),
+        "pending": int(pending),
+        "started_at": STARTED_AT,
+        "last_seen": now_iso(),
+    }
+    fields = {key: {"stringValue": "" if value is None else str(value)}
+              for key, value in values.items()}
+    fields["poll_seconds"] = {"integerValue": str(values["poll_seconds"])}
+    fields["pending"] = {"integerValue": str(values["pending"])}
+
+    doc_id = worker_id()
+    try:
+        resp = requests.patch(
+            f"{DOCUMENTS_API}/{STATUS_COLLECTION}/{doc_id}",
+            headers=auth_headers(id_token),
+            params={"updateMask.fieldPaths": list(values.keys())},
+            json={"fields": fields},
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code >= 400 and not _status_warning_shown:
+            _status_warning_shown = True
+            log(f"Could not write the worker heartbeat "
+                f"({resp.status_code}) - the app will show this worker as "
+                "offline until the workerStatus rules allow it. Posting is "
+                "not affected.")
+    except requests.RequestException as e:
+        if not _status_warning_shown:
+            _status_warning_shown = True
+            log(f"Could not write the worker heartbeat ({e}) - the app will "
+                "show this worker as offline. Posting is not affected.")
 
 
 def owner_pat(id_token, uid):
@@ -537,6 +688,15 @@ def post_comment(pat, work_item_id, html, org_url):
     resp = requests.post(
         url, auth=HTTPBasicAuth("", pat), json={"text": html}, timeout=HTTP_TIMEOUT
     )
+    if resp.status_code in (401, 403):
+        # TFS answers both for a PAT problem: 401 when the token itself is
+        # not accepted, 403 when it is accepted but the account is not allowed
+        # to write here. An empty body is normal, so say what it means.
+        raise RuntimeError(
+            f"TFS rejected the PAT ({resp.status_code}) at {org_url} - it is "
+            "expired, was regenerated after this comment was scheduled, or "
+            "its account has no access to that project"
+        )
     if resp.status_code >= 400:
         raise RuntimeError(
             f"TFS returned {resp.status_code}: {resp.text[:200]}"
@@ -587,9 +747,13 @@ def leave_pending(id_token, doc_id, label, reason):
         log(f"{label}: NOT posting - {reason}")
 
 
-def run_once(id_token, shared_pat, org_url, max_attempts, strict_author=False,
-             allow_shared_pat=False):
-    """Post every pending comment that is due. Returns how many were posted."""
+def run_once(id_token, shared_pat, fallback_org_url, max_attempts,
+             strict_author=False, allow_shared_pat=False):
+    """Post every pending comment that is due.
+
+    Returns (posted, pending): the count the heartbeat reports, so the app can
+    say how much work a live worker is carrying.
+    """
     posted = 0
     pending = fetch_pending(id_token)
 
@@ -602,7 +766,26 @@ def run_once(id_token, shared_pat, org_url, max_attempts, strict_author=False,
         work_item_id = str(doc.get("work_item_id", "")).strip()
         attempts = doc.get("attempts", 0) or 0
         owner_email = (doc.get("owner_email") or "").strip()
-        label = f"{COLLECTION}/{doc_id} (WI {work_item_id or '?'})"
+
+        # Which project this comment belongs to, decided by the schedule (the
+        # app writes it). Older schedules have none and use the fallback, which
+        # is this worker's own TFS_ORG_URL rather than something a document
+        # asked for, so it is trusted without the allowlist below.
+        stored_target = (doc.get("tfs_org_url") or "").strip()
+        org_url = target_url(doc) if stored_target else fallback_org_url
+        if not org_url:
+            log(f"{COLLECTION}/{doc_id}: refusing unknown project "
+                f"{doc.get('tfs_org_url')!r} - it is not in this worker's "
+                "TFS_TARGETS")
+            patch_fields(id_token, doc_id, {
+                "status": "failed",
+                "last_error": ("Unknown project "
+                               f"{doc.get('tfs_org_url')}"),
+            })
+            continue
+
+        label = (f"{COLLECTION}/{doc_id} (WI {work_item_id or '?'} "
+                 f"{target_label(doc, org_url)})")
 
         # A fresh claim belongs to another instance (or to this one, moments
         # ago); only an abandoned one is retried here.
@@ -657,7 +840,7 @@ def run_once(id_token, shared_pat, org_url, max_attempts, strict_author=False,
             leave_pending(id_token, doc_id, label, refusal)
             continue
 
-        log(f"{label}: posting with {source}")
+        log(f"{label}: posting with {source} [token {token_fingerprint(pat)}]")
 
         # Name the account the comment will actually be written by. Without
         # this the author is only implied by which token happened to be used,
@@ -697,7 +880,7 @@ def run_once(id_token, shared_pat, org_url, max_attempts, strict_author=False,
             # it so the retry reads users/{uid} again.
             if owner_uid:
                 _pat_cache.pop(owner_uid, None)
-            log(f"{label}: attempt {attempts} failed: {e}")
+            log(f"{label}: attempt {attempts} failed at {org_url}: {e}")
             patch_fields(id_token, doc_id, {
                 "status": "failed" if give_up else "pending",
                 "attempts": attempts,
@@ -728,10 +911,10 @@ def run_once(id_token, shared_pat, org_url, max_attempts, strict_author=False,
         posted += 1
         log(f"{label}: comment posted")
 
-    return posted
+    return posted, len(pending)
 
 
-def check(id_token, shared_pat, org_url, allow_shared_pat=False):
+def check(id_token, shared_pat, fallback_org_url, allow_shared_pat=False):
     """Report who each pending schedule would post as. Writes nothing.
 
     This is the answer to "why is my comment under the wrong name": either the
@@ -743,13 +926,13 @@ def check(id_token, shared_pat, org_url, allow_shared_pat=False):
     log(f"{len(pending)} schedule(s) pending or sending (nothing will be posted)")
 
     if shared_pat:
-        identity = pat_identity(shared_pat, org_url)
+        identity = pat_identity(shared_pat, fallback_org_url)
         if identity:
             log(f"TFS_PAT belongs to {identity['unique_name']}"
                 + (f" ({identity['display_name']})" if identity["display_name"] else ""))
         else:
             log("TFS_PAT: could not resolve its TFS account - check the token "
-                "is valid for " + org_url)
+                "is valid for " + fallback_org_url)
     else:
         log("TFS_PAT is not set - a schedule with no stored PAT cannot post")
 
@@ -758,24 +941,29 @@ def check(id_token, shared_pat, org_url, allow_shared_pat=False):
         doc_id = doc["_id"]
         owner_email = (doc.get("owner_email") or "").strip()
         owner_uid, pat, source = resolve_pat(id_token, doc, shared_pat)
+        stored_target = (doc.get("tfs_org_url") or "").strip()
+        org_url = target_url(doc) if stored_target else fallback_org_url
         head = (
             f"scheduledComments/{doc_id}: WI {doc.get('work_item_id') or '?'}, "
             f"due {doc.get('due_at') or '?'}, {doc.get('status') or '?'}"
         )
         log(head)
+        log(f"    project: "
+            + (target_label(doc, org_url) if org_url
+               else f"UNKNOWN ({stored_target}) - would be refused"))
         log(f"    scheduled by: {owner_email or '(no email)'} "
             f"uid={owner_uid or '(missing owner_uid)'}")
         if not pat:
             log("    token: NONE - this schedule stays pending until a token exists")
             wrong += 1
             continue
-        log(f"    token: {source}")
+        log(f"    token: {source} [token {token_fingerprint(pat)}]")
         if source == "the shared TFS_PAT" and not allow_shared_pat:
             log("    blocked: TFS_ALLOW_SHARED_PAT is not set, so this would not "
                 "post at all rather than post under the wrong author")
             wrong += 1
             continue
-        identity = pat_identity(pat, org_url)
+        identity = pat_identity(pat, org_url or fallback_org_url)
         if not identity:
             log("    author: unknown here - when this posts, the worker reports "
                 "who TFS actually recorded")
@@ -838,7 +1026,10 @@ def main(argv):
             "own token. It is only needed for older schedules saved without "
             "one, and only when TFS_ALLOW_SHARED_PAT=1.")
 
-    log(f"AutoReport comment worker starting (org={org_url}, poll={poll_seconds}s)")
+    log(f"AutoReport comment worker starting (id={worker_id()}, "
+        f"default={org_url}, poll={poll_seconds}s)")
+    log("Projects: " + ", ".join(f"{name} -> {url}"
+                                 for name, url in TFS_TARGETS.items()))
     try:
         id_token, refresh_token = sign_in(email, password)
     except RuntimeError as e:
@@ -854,6 +1045,10 @@ def main(argv):
         check(id_token, shared_pat, org_url, allow_shared_pat)
         return 0
 
+    # First heartbeat before any poll, so a freshly started worker shows as
+    # online in the app even when nothing is due.
+    write_heartbeat(id_token, poll_seconds, 0)
+
     while True:
         try:
             # Refresh well before the one-hour token expiry.
@@ -862,8 +1057,10 @@ def main(argv):
                 last_refresh = time.time()
                 log("Session refreshed")
 
-            run_once(id_token, shared_pat, org_url, max_attempts, strict_author,
-                     allow_shared_pat)
+            posted, waiting = run_once(
+                id_token, shared_pat, org_url, max_attempts, strict_author,
+                allow_shared_pat)
+            write_heartbeat(id_token, poll_seconds, waiting)
         except PermissionError:
             log("Firestore refused the token - refreshing the session")
             id_token, refresh_token = refresh_session(refresh_token)

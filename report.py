@@ -94,6 +94,22 @@ logger = logging.getLogger("report")
 
 org_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection/WebPOS"
 collection_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection"
+
+# TFS projects a scheduled comment can be posted to, as (label, URL). The
+# label is what the dialog shows; the URL is stored on the schedule and the
+# worker posts to it (it refuses any URL outside its own TFS_TARGETS list, so
+# a person's PAT can never be sent to a host it was not configured for).
+TFS_TARGETS = [
+    ("WebPOS", org_url),
+    ("WPS", "https://tfs.alliancewebpos.com/tfs/WPSCollection/WPS"),
+]
+DEFAULT_TFS_TARGET = TFS_TARGETS[0][0]
+
+# The hosted worker writes a heartbeat document to this collection every poll;
+# the Scheduled Comment dialog reads it to say whether a worker is running.
+WORKER_STATUS_COLLECTION = "workerStatus"
+# Worker polls every 30s by default, so this tolerates four missed beats.
+WORKER_ONLINE_SECONDS = 120
 _TFS_HOST = collection_url.split("/tfs/")[0]
 template_path = TEMPLATE_PATH
 
@@ -1792,7 +1808,7 @@ def _comment_html(text, image_urls=None, rich_html=""):
     return body.strip()
 
 
-def _upload_comment_image(pat, work_item_id, file_path):
+def _upload_comment_image(pat, work_item_id, file_path, target_url=None):
     """Upload an image as a work item attachment and return its URL.
 
     Images are attached at compose time on purpose: the worker on the host
@@ -1805,7 +1821,8 @@ def _upload_comment_image(pat, work_item_id, file_path):
     with open(file_path, "rb") as handle:
         payload = handle.read()
 
-    url = f"{org_url}/_apis/wit/attachments?fileName={quote(name)}&api-version=5.1"
+    base = (target_url or org_url).rstrip("/")
+    url = f"{base}/_apis/wit/attachments?fileName={quote(name)}&api-version=5.1"
     logger.info("Uploading image for work item %s: %s (%d bytes)",
                 work_item_id, name, len(payload))
     resp = requests.post(
@@ -4276,7 +4293,7 @@ class ScheduleCommentWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, user_data, work_item_id, due_at, body, image_paths,
-                 parent=None, body_html=""):
+                 parent=None, body_html="", target_label="", target_url=""):
         super().__init__(parent)
         self.user_data = user_data
         self.work_item_id = work_item_id
@@ -4284,6 +4301,8 @@ class ScheduleCommentWorker(QThread):
         self.body = body
         self.body_html = body_html
         self.image_paths = image_paths or []
+        self.target_label = target_label or DEFAULT_TFS_TARGET
+        self.target_url = target_url or org_url
 
     def run(self):
         try:
@@ -4298,7 +4317,8 @@ class ScheduleCommentWorker(QThread):
             image_urls = []
             for index, path in enumerate(self.image_paths, 1):
                 self.progress.emit(f"Uploading image {index}/{len(self.image_paths)}...")
-                url = _upload_comment_image(pat, self.work_item_id, path)
+                url = _upload_comment_image(pat, self.work_item_id, path,
+                                            self.target_url)
                 image_urls.append(url)
                 uploads[os.path.basename(path)] = url
 
@@ -4318,6 +4338,10 @@ class ScheduleCommentWorker(QThread):
                 "owner_uid": self.user_data.get("uid", ""),
                 "owner_email": self.user_data.get("email", ""),
                 "work_item_id": str(self.work_item_id),
+                # Which project this comment belongs to. The worker refuses a
+                # URL that is not in its own allowlist.
+                "tfs_target": self.target_label,
+                "tfs_org_url": self.target_url,
                 "due_at": self.due_at,
                 "body_text": body_text,
                 "html": html,
@@ -4347,8 +4371,8 @@ class ScheduleCommentWorker(QThread):
                                    self.user_data.get("uid", ""))
 
             doc_id = _fs_create(SCHEDULED_COMMENTS_COLLECTION, token, values)
-            logger.info("Scheduled comment saved: doc=%s wi=%s due=%s",
-                        doc_id, self.work_item_id, self.due_at)
+            logger.info("Scheduled comment saved: doc=%s wi=%s target=%s due=%s",
+                        doc_id, self.work_item_id, self.target_label, self.due_at)
             self.saved.emit(doc_id)
         except Exception as e:
             logger.exception("Could not save the scheduled comment")
@@ -4379,6 +4403,83 @@ class ScheduledCommentsListWorker(QThread):
             self.loaded.emit(documents)
         except Exception as e:
             logger.exception("Could not load scheduled comments")
+            self.failed.emit(str(e))
+
+
+def _parse_utc(text):
+    """Firestore timestamp ('2026-11-06T12:00:00Z') -> aware datetime, or None."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def _ago(seconds):
+    """'4s ago', '3m ago', '2h 5m ago' - short enough for one line."""
+    seconds = int(seconds or 0)
+    if seconds < 90:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 90:
+        return f"{minutes}m ago"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours}h {minutes}m ago"
+    return f"{hours // 24}d ago"
+
+
+class WorkerStatusWorker(QThread):
+    """Reads the hosted worker's heartbeat from Firestore.
+
+    A panel host (bot-hosting.net, Pterodactyl) usually exposes no public HTTP
+    port, so polling the worker directly would report "offline" for a worker
+    that is running fine. It already has Firestore access, so it writes a
+    heartbeat document on every poll and this reads the newest one.
+    """
+    loaded = pyqtSignal(object)   # dict: online, known, seconds, projects, pending
+    failed = pyqtSignal(str)
+
+    def __init__(self, user_data, parent=None):
+        super().__init__(parent)
+        self.user_data = user_data
+
+    def run(self):
+        try:
+            token = _refresh_id_token(self.user_data) or self.user_data.get("id_token", "")
+            if not token:
+                self.failed.emit("not signed in")
+                return
+            documents = _fs_query(WORKER_STATUS_COLLECTION, token, limit=20)
+
+            newest = None
+            for doc in documents:
+                seen = _parse_utc(doc.get("last_seen"))
+                if seen is None:
+                    continue
+                if newest is None or seen > newest[0]:
+                    newest = (seen, doc)
+
+            if newest is None:
+                self.loaded.emit({"online": False, "known": False,
+                                  "seconds": None, "projects": "",
+                                  "pending": 0})
+                return
+
+            seen, doc = newest
+            seconds = max(0, int((datetime.now(timezone.utc) - seen).total_seconds()))
+            self.loaded.emit({
+                "online": seconds <= WORKER_ONLINE_SECONDS,
+                "known": True,
+                "seconds": seconds,
+                "projects": str(doc.get("projects") or ""),
+                "pending": doc.get("pending") or 0,
+            })
+        except Exception as e:
+            logger.warning("Worker status check failed: %s", e)
             self.failed.emit(str(e))
 
 
@@ -4425,9 +4526,30 @@ class ScheduledCommentDialog(QDialog):
         subtitle.setStyleSheet("font-size: 12px; color: #6b7280;")
         compose.addWidget(subtitle)
 
+        # Whether a worker is actually polling the queue. Without this a
+        # schedule saves happily into a host that has been down for days and
+        # nothing explains why the comment never appears.
+        status_row = QtWidgets.QHBoxLayout()
+        status_row.setSpacing(8)
+        self.worker_status_label = QtWidgets.QLabel("Checking whether a worker is online...")
+        self.worker_status_label.setWordWrap(True)
+        self.worker_status_label.setStyleSheet("font-size: 12px; color: #6b7280;")
+        status_row.addWidget(self.worker_status_label, stretch=1)
+        self.worker_check_btn = QPushButton("Check")
+        self.worker_check_btn.setObjectName("ghost")
+        self.worker_check_btn.clicked.connect(self.refresh_worker_status)
+        status_row.addWidget(self.worker_check_btn)
+        compose.addLayout(status_row)
+
         form = QtWidgets.QFormLayout()
         form.setSpacing(8)
         form.setContentsMargins(0, 6, 0, 6)
+
+        self.target_input = QComboBox()
+        for label, url in TFS_TARGETS:
+            self.target_input.addItem(label, url)
+        self.target_input.setMaximumWidth(240)
+        form.addRow("Project:", self.target_input)
 
         self.work_item_input = QLineEdit()
         self.work_item_input.setPlaceholderText("e.g. 123456")
@@ -4535,7 +4657,15 @@ class ScheduledCommentDialog(QDialog):
 
         layout.addWidget(side)
 
+        self._status_worker = None
+        self._worker_status = None
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(30000)
+        self._status_timer.timeout.connect(self.refresh_worker_status)
+        self._status_timer.start()
+
         self.refresh_list()
+        self.refresh_worker_status()
         self.showMaximized()
 
     def _style(self):
@@ -4721,6 +4851,30 @@ class ScheduledCommentDialog(QDialog):
             return
         due_utc = local_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        target_label = self.target_input.currentText() or DEFAULT_TFS_TARGET
+        target_url = self.target_input.currentData() or org_url
+
+        # Saving is harmless but useless while nothing is polling the queue, so
+        # say it once and let the person decide rather than blocking them.
+        status = self._worker_status
+        if status is not None and not status.get("online"):
+            if status.get("known"):
+                detail = ("The last worker heartbeat was "
+                          f"{_ago(status.get('seconds'))}.")
+            else:
+                detail = "No worker has written a heartbeat yet."
+            answer = QMessageBox.question(
+                self,
+                "Worker offline",
+                f"{detail}\n\nThe comment will stay queued until a worker is "
+                "running - nothing will post it until then.\n\n"
+                "Schedule it anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
         self._set_busy(True)
         self.status_label.setText("Uploading and saving...")
 
@@ -4728,6 +4882,7 @@ class ScheduledCommentDialog(QDialog):
             self.user_data, work_item_id, due_utc, body,
             list(self.image_paths), self,
             body_html=self.body_input.toHtml(),
+            target_label=target_label, target_url=target_url,
         )
         self._save_worker.progress.connect(self.status_label.setText)
         self._save_worker.saved.connect(self._on_saved)
@@ -4755,6 +4910,76 @@ class ScheduledCommentDialog(QDialog):
         self._set_busy(False)
         logger.warning("Scheduling failed: %s", message)
         self.status_label.setText(f"Could not schedule: {message}")
+
+    # --- worker status ---
+
+    def refresh_worker_status(self):
+        """Ask Firestore for the newest worker heartbeat."""
+        if not self.user_data.get("uid"):
+            self.worker_status_label.setText("Worker status: not signed in.")
+            return
+        # One check at a time: the timer fires again 30s later regardless.
+        if self._status_worker is not None and self._status_worker.isRunning():
+            return
+        if _ui_alive(self.worker_check_btn):
+            self.worker_check_btn.setEnabled(False)
+        self._status_worker = WorkerStatusWorker(self.user_data, self)
+        self._status_worker.loaded.connect(self._on_worker_status)
+        self._status_worker.failed.connect(self._on_worker_status_failed)
+        self._status_worker.start()
+
+    def _on_worker_status(self, status):
+        self._worker_status = status
+        if _ui_alive(self.worker_check_btn):
+            self.worker_check_btn.setEnabled(True)
+        if not _ui_alive(self.worker_status_label):
+            return
+
+        if status.get("online"):
+            projects = status.get("projects") or "project list unknown"
+            text = (f"Worker online \u00b7 {projects} \u00b7 heartbeat "
+                    f"{_ago(status.get('seconds'))}")
+            color = "#16a34a"
+        elif status.get("known"):
+            text = ("Worker offline \u00b7 last heartbeat "
+                    f"{_ago(status.get('seconds'))} - scheduled comments will "
+                    "wait until it is back")
+            color = "#dc2626"
+        else:
+            text = ("Worker status unknown \u00b7 no heartbeat recorded yet - "
+                    "is the worker running?")
+            color = "#d97706"
+        self.worker_status_label.setText(text)
+        self.worker_status_label.setStyleSheet(
+            f"font-size: 12px; font-weight: 600; color: {color};"
+        )
+
+    def _on_worker_status_failed(self, message):
+        if _ui_alive(self.worker_check_btn):
+            self.worker_check_btn.setEnabled(True)
+        if not _ui_alive(self.worker_status_label):
+            return
+        self._worker_status = None
+        # A 403 here always means the workerStatus rules are missing or were
+        # never published - say so rather than leaving the raw message alone.
+        hint = ""
+        lowered = (message or "").lower()
+        if "refused" in lowered or "insufficient permissions" in lowered \
+                or "expired" in lowered:
+            hint = (" - add the workerStatus rules from the README and press "
+                    "Publish in Firestore")
+        self.worker_status_label.setText(
+            f"Worker status unknown \u00b7 could not check ({message}){hint}"
+        )
+        self.worker_status_label.setStyleSheet(
+            "font-size: 12px; font-weight: 600; color: #d97706;"
+        )
+
+    def closeEvent(self, event):
+        # The dialog is about to be destroyed; stop the periodic check first.
+        if getattr(self, "_status_timer", None) is not None:
+            self._status_timer.stop()
+        super().closeEvent(event)
 
     # --- saved schedules ---
 
@@ -4798,7 +5023,9 @@ class ScheduledCommentDialog(QDialog):
             when = local.strftime("%m/%d/%Y %I:%M %p")
         except (TypeError, ValueError):
             when = due or "?"
-        return f"WI {doc.get('work_item_id', '?')}\n{when}"
+        target = str(doc.get("tfs_target") or "").strip()
+        suffix = f" \u00b7 {target}" if target and target != DEFAULT_TFS_TARGET else ""
+        return f"WI {doc.get('work_item_id', '?')}{suffix}\n{when}"
 
     def cancel_selected(self):
         row = self.list_view.currentRow()
