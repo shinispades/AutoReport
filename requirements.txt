@@ -30,3 +30,18 @@ Pillow==12.3.0; python_version >= "3.13"
 python-docx==1.1.2
 openpyxl==3.1.5
 tzdata==2024.2
+
+# --- PTU reading ------------------------------------------------------
+# pypdf reads a PDF's own text layer; pypdfium2 renders scanned pages to
+# pixels so Windows OCR can read them. The winrt-* packages are Microsoft's
+# projections of Windows.Media.Ocr: the OCR engine is the one Windows already
+# uses (Photos, PowerToys), so nothing extra lands on the PC and the exe grows
+# by only a few MB. These are ranges, not pins, so the first build picks
+# versions that actually have wheels - pin them with pip freeze afterwards,
+# as the note at the top of this file describes.
+pypdf>=5,<7
+pypdfium2>=4,<5
+winrt-runtime>=4
+winrt-Windows.Graphics.Imaging
+winrt-Windows.Media.Ocr
+winrt-Windows.Storage.Streams

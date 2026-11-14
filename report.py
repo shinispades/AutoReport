@@ -2,6 +2,8 @@ import sys
 import os
 import re
 import json
+import base64
+import difflib
 import time
 import shutil
 import tempfile
@@ -9,6 +11,7 @@ import winreg
 import ctypes
 import ctypes.wintypes
 import logging
+import asyncio
 from datetime import datetime, timezone
 from io import BytesIO
 from logging.handlers import RotatingFileHandler
@@ -94,22 +97,6 @@ logger = logging.getLogger("report")
 
 org_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection/WebPOS"
 collection_url = "https://tfs.alliancewebpos.com/tfs/WebPOSCollection"
-
-# TFS projects a scheduled comment can be posted to, as (label, URL). The
-# label is what the dialog shows; the URL is stored on the schedule and the
-# worker posts to it (it refuses any URL outside its own TFS_TARGETS list, so
-# a person's PAT can never be sent to a host it was not configured for).
-TFS_TARGETS = [
-    ("WebPOS", org_url),
-    ("WPS", "https://tfs.alliancewebpos.com/tfs/WPSCollection/WPS"),
-]
-DEFAULT_TFS_TARGET = TFS_TARGETS[0][0]
-
-# The hosted worker writes a heartbeat document to this collection every poll;
-# the Scheduled Comment dialog reads it to say whether a worker is running.
-WORKER_STATUS_COLLECTION = "workerStatus"
-# Worker polls every 30s by default, so this tolerates four missed beats.
-WORKER_ONLINE_SECONDS = 120
 _TFS_HOST = collection_url.split("/tfs/")[0]
 template_path = TEMPLATE_PATH
 
@@ -128,7 +115,7 @@ UPDATE_OK_FILE = "_update_ok.flag"       # written once a window is up
 UPDATE_FAILED_FILE = "_update_failed.txt"  # written by the swap script
 
 # ================= AUTO-UPDATE CONFIG =================
-APP_VERSION = "3.0.10"
+APP_VERSION = "4.0.0"
 GITHUB_REPO = "shinispades/AutoReport"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -175,6 +162,15 @@ TOOL_REGISTRY = [
         "description": "Write a TFS comment with images and links, then let the hosted worker post it at the time you choose",
         "icon": "⏰",
         "handler": "run_scheduled_comment",
+        "category": "Reports",
+    },
+    # --- PTU Generator ---
+    {
+        "id": "ptu_generator",
+        "name": "PTU Generator",
+        "description": "Read a PTU permit from a PDF or an image and show the text the app can see in it",
+        "icon": "🧾",
+        "handler": "run_ptu_generator",
         "category": "Reports",
     },
     # --- Tool 3 ---
@@ -388,17 +384,22 @@ def _check_for_update():
 
 
 def _download_update(download_url, progress_callback=None,
-                     expected_size=None, expected_digest=None, attempts=3):
+                     expected_size=None, expected_digest=None, attempts=3,
+                     local_name=None):
     """
     Download an update and verify it before returning the path.
 
     Retries transient failures, writes to a .part file so an interrupted
     download can never be mistaken for a finished one, and checks the size and
     SHA-256 the release advertises. Returns the path, or None on failure.
+
+    local_name overrides the on-disk name, which is how an .exe release is
+    saved without an .exe extension (see _staged_update_name).
     """
     import hashlib
 
-    filename = os.path.basename(download_url.split("?")[0]) or "update.zip"
+    filename = (local_name or os.path.basename(download_url.split("?")[0])
+                or "update.zip")
     # One private directory per download. The shared %TEMP% let a second
     # session - or another user on the same machine - collide with, or
     # pre-place, the file this process is about to execute.
@@ -502,11 +503,19 @@ def _restore_from_backup(prev_dir, app_dir, names):
     Copy backed-up originals back over whatever an update already replaced.
     Best effort: anything still locked is skipped and logged.
     """
+    running_exe = (os.path.basename(sys.executable)
+                   if getattr(sys, 'frozen', False) else "")
     restored = 0
     for name in names:
         src = os.path.join(prev_dir, name)
         dst = os.path.join(app_dir, name)
         if not os.path.exists(src):
+            continue
+        if running_exe and os.path.normcase(name) == os.path.normcase(running_exe):
+            # The exe running this code cannot be written over, and it was
+            # never replaced anyway - a locked file is staged as .new instead.
+            # Counting it as a failed rollback only hid the real error.
+            logger.info("Left the running %s in place - it was never replaced", name)
             continue
         try:
             if os.path.isdir(src):
@@ -654,6 +663,9 @@ def _apply_zip_update(zip_path, version=""):
 
     extract_dir = os.path.join(tempfile.gettempdir(), "update_extract")
     prev_dir = os.path.join(app_dir, UPDATE_PREV_DIR)
+    # Defined before the try so the failure handler below can still clean up if
+    # extraction itself is what raised.
+    entries = []
 
     try:
         if os.path.exists(extract_dir):
@@ -806,9 +818,103 @@ def _apply_zip_update(zip_path, version=""):
         restored = 0
         if os.path.isdir(prev_dir):
             restored = _restore_from_backup(prev_dir, app_dir, os.listdir(prev_dir))
+        # Drop anything this attempt staged as .new. Left behind, a release that
+        # ships only templates would later swap an old exe in over the current
+        # one, and the exe already has a matching copy in _prev/.
+        for item in entries:
+            staged = os.path.join(app_dir, item) + ".new"
+            try:
+                if os.path.isdir(staged):
+                    shutil.rmtree(staged)
+                elif os.path.exists(staged):
+                    os.remove(staged)
+                    logger.info("Removed staged file from the failed attempt: %s", staged)
+            except OSError:
+                logger.warning("Could not remove staged file: %s", staged)
         shutil.rmtree(extract_dir, ignore_errors=True)
         return False, f"The update could not be applied ({e}). Restored {restored} item(s) from _prev."
 
+
+
+def _staged_update_name(version):
+    """File name a downloaded .exe update is parked under.
+
+    Deliberately without a .exe extension. The file is never launched under
+    this name - the swap script renames it to the real exe name after this
+    process exits - and an extension-based scanner heuristic on a freshly
+    downloaded .exe is exactly what this avoids.
+    """
+    base = (os.path.basename(sys.executable) if getattr(sys, 'frozen', False)
+            else "report.py")
+    return f"{base}.update.v{version or 'new'}"
+
+
+def _apply_exe_update(downloaded_path, version=""):
+    """Park a verified .exe update beside the app for the swap script to rename.
+
+    Only the executable is replaced: templates and `asset/` still come from a
+    .zip release.
+
+    Order is deliberate, and matches _apply_zip_update: back the current exe up
+    into _prev/ first, then move the download into place under its non-.exe
+    name, then write the script that does the rename. A build that never
+    reaches a window is rolled back from _prev/ by _recover_failed_update().
+
+    Returns (ok, message).
+    """
+    if not getattr(sys, 'frozen', False):
+        return False, ("This copy runs from source, so a .exe update cannot "
+                       "replace it. Publish a .zip release instead.")
+
+    app_dir = _app_dir()
+    exe_name = os.path.basename(sys.executable)
+    target = os.path.join(app_dir, exe_name)
+    prev_dir = os.path.join(app_dir, UPDATE_PREV_DIR)
+    staged = os.path.join(app_dir, _staged_update_name(version))
+
+    logger.info("Applying exe update: %s -> %s", downloaded_path, staged)
+
+    if not os.path.isfile(target):
+        return False, f"{exe_name} was not found in {app_dir}, so nothing was replaced."
+
+    try:
+        # One generation back only, same as the zip path: a stale entry from an
+        # older round must not be restored over a newer file.
+        if os.path.isdir(prev_dir):
+            shutil.rmtree(prev_dir, ignore_errors=True)
+        os.makedirs(prev_dir, exist_ok=True)
+        shutil.copy2(target, os.path.join(prev_dir, exe_name))
+
+        if os.path.exists(staged):
+            os.remove(staged)
+        shutil.move(downloaded_path, staged)
+    except Exception as e:
+        logger.exception("Could not stage the exe update")
+        return False, f"The update could not be staged ({e}). Nothing was replaced."
+
+    try:
+        _write_swap_script(os.path.join(app_dir, "_update_swap.bat"),
+                           app_dir, exe_name, [(staged, target)])
+    except Exception as e:
+        logger.exception("Could not write the swap script")
+        return False, (f"The update was saved as {staged}, but the swap script "
+                       f"could not be written ({e}).")
+
+    # Trial marker: the next start has to reach a visible window, otherwise
+    # _recover_failed_update() puts the exe saved in _prev/ back.
+    try:
+        with open(os.path.join(app_dir, UPDATE_TRIAL_FILE), "w", encoding="utf-8") as f:
+            json.dump({"version": version, "at": datetime.now().isoformat()}, f)
+    except OSError:
+        logger.warning("Could not write the update trial marker")
+
+    try:
+        os.remove(os.path.join(app_dir, UPDATE_FAILED_FILE))
+    except OSError:
+        pass
+
+    logger.info("Exe update staged for the swap script: %s", staged)
+    return True, ""
 
 
 def _bat_quote(path):
@@ -899,7 +1005,10 @@ def _write_swap_script(bat_path, app_dir, exe_name, locked_files):
         '"%s" -n 2 127.0.0.1 >nul' % ping,
         "goto replace_loop",
         ":replace_giveup",
-        'echo "%~2">> %s' % _bat_quote(failed_path),
+        # %%~2: the trailing %% is consumed by the %-formatting below, otherwise
+        # Python reads "%~" as a format spec and raises ValueError instead of
+        # writing the script.
+        'echo "%%~2">> %s' % _bat_quote(failed_path),
         "exit /b 1",
     ]
 
@@ -928,6 +1037,9 @@ def _write_swap_script(bat_path, app_dir, exe_name, locked_files):
 # The users/{uid} rules must stay owner-only: with PAT_SYNC_TO_FIRESTORE on,
 # the TFS PAT is kept in that document. Anyone who can read the collection -
 # a leaked key, a wrong rule - is then holding the token. See _save_pat_remote().
+# The PTU tool's Gemini API key rides in the same owner-only document (field
+# gemini_api_key), for exactly the same reason: it must follow the account
+# without becoming readable by anyone but its owner. See _save_ai_key_remote().
 #
 # Auth is two plain HTTP endpoints (Identity Toolkit + Secure Token), so the
 # unmaintained pyrebase package - and the gcloud/oauth2client/pycryptodome
@@ -1808,7 +1920,7 @@ def _comment_html(text, image_urls=None, rich_html=""):
     return body.strip()
 
 
-def _upload_comment_image(pat, work_item_id, file_path, target_url=None):
+def _upload_comment_image(pat, work_item_id, file_path):
     """Upload an image as a work item attachment and return its URL.
 
     Images are attached at compose time on purpose: the worker on the host
@@ -1821,8 +1933,7 @@ def _upload_comment_image(pat, work_item_id, file_path, target_url=None):
     with open(file_path, "rb") as handle:
         payload = handle.read()
 
-    base = (target_url or org_url).rstrip("/")
-    url = f"{base}/_apis/wit/attachments?fileName={quote(name)}&api-version=5.1"
+    url = f"{org_url}/_apis/wit/attachments?fileName={quote(name)}&api-version=5.1"
     logger.info("Uploading image for work item %s: %s (%d bytes)",
                 work_item_id, name, len(payload))
     resp = requests.post(
@@ -2131,11 +2242,13 @@ class UpdateDownloadWorker(QThread):
     downloaded = pyqtSignal(str)      # verified local path
     failed = pyqtSignal(str)
 
-    def __init__(self, url, expected_size=None, expected_digest=None, parent=None):
+    def __init__(self, url, expected_size=None, expected_digest=None, parent=None,
+                 local_name=None):
         super().__init__(parent)
         self.url = url
         self.expected_size = expected_size
         self.expected_digest = expected_digest
+        self.local_name = local_name
 
     def run(self):
         try:
@@ -2144,6 +2257,7 @@ class UpdateDownloadWorker(QThread):
                 progress_callback=lambda done, total: self.progress.emit(done, total),
                 expected_size=self.expected_size,
                 expected_digest=self.expected_digest,
+                local_name=self.local_name,
             )
         except Exception:
             logger.exception("Update download crashed")
@@ -2294,6 +2408,10 @@ class UpdateDialog(QtWidgets.QDialog):
             update_info["download_url"],
             expected_size=update_info.get("size"),
             expected_digest=update_info.get("digest"),
+            # An .exe is saved under a name that does not end in .exe; the swap
+            # script renames it to Report.exe after this process exits.
+            local_name=(_staged_update_name(update_info.get("version", ""))
+                        if asset_type != "zip" else None),
             parent=self,
         )
         self._download_worker.progress.connect(self._on_download_progress)
@@ -2363,18 +2481,22 @@ class UpdateDialog(QtWidgets.QDialog):
                 self.status_label.setText(message or "Failed to apply update.")
                 self._turn_download_button_into_close()
         else:
-            # .exe — launch installer and exit
-            self.status_label.setText("Download complete! Launching installer...")
+            # .exe - park it under a name that does not end in .exe, then let
+            # the swap script rename it over the running exe once this process
+            # has exited. The file is never launched under its download name.
+            self.status_label.setText("Verifying and installing update...")
+            self.download_btn.setText("Applying update...")
             QtWidgets.QApplication.processEvents()
-            logger.info("Launching update: %s", path)
-            try:
-                import subprocess
-                subprocess.Popen([path], shell=False)
-                logger.info("Update installer launched, exiting app")
-                QtWidgets.QApplication.quit()
-            except Exception:
-                logger.exception("Failed to launch update installer")
-                self.status_label.setText(f"Downloaded to: {path}")
+            logger.info("Applying exe update: %s", path)
+
+            ok, message = _apply_exe_update(path, update_info.get("version", ""))
+            if ok:
+                self.status_label.setText("Update applied! Restarting app...")
+                QtWidgets.QApplication.processEvents()
+                logger.info("Exe update staged, restarting app")
+                self._restart_app()
+            else:
+                self.status_label.setText(message or "Failed to apply update.")
                 self._turn_download_button_into_close()
 
     def _turn_download_button_into_close(self):
@@ -3966,6 +4088,67 @@ def _write_temp_image(image):
         return ""
 
 
+_CLIPBOARD_FILES = "AutoReport-clipboard"
+
+
+def _clipboard_directory():
+    """Where the pictures of a TFS copy are put for the paste target.
+
+    TFS's comment editor ignores an <img> that arrives in pasted HTML, but it
+    does upload picture *files* the way it uploads a pasted screenshot. So the
+    files have to exist on disk while the clipboard holds them.
+    """
+    return os.path.join(tempfile.gettempdir(), _CLIPBOARD_FILES)
+
+
+def _clear_clipboard_files():
+    """Forget the previous copy: its files are no longer on the clipboard."""
+    directory = _clipboard_directory()
+    if not os.path.isdir(directory):
+        return
+    for name in os.listdir(directory):
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            logger.warning("Could not remove an old clipboard picture: %s", name)
+
+
+_DRAFT_FILE = "draft.json"
+
+
+def _draft_directory():
+    """Where an unfinished scheduled comment waits between runs.
+
+    %LOCALAPPDATA% rather than the temp folder: Windows is free to clean temp,
+    and the whole point of the draft is to outlive whatever ended the app.
+    """
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    return os.path.join(base, "AutoReport", "scheduled-comment-draft")
+
+
+def _clear_scheduled_draft():
+    """Forget the local draft: it has been scheduled, or emptied."""
+    directory = _draft_directory()
+    if not os.path.isdir(directory):
+        return
+    try:
+        shutil.rmtree(directory)
+    except OSError:
+        logger.warning("Could not clear the scheduled comment draft",
+                       exc_info=True)
+
+
+def _load_scheduled_draft():
+    """The saved draft as a dict, or None when there is nothing to restore."""
+    try:
+        with open(os.path.join(_draft_directory(), _DRAFT_FILE),
+                  encoding="utf-8") as handle:
+            draft = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return draft if isinstance(draft, dict) else None
+
+
 class RemoteImageFetcher(QThread):
     """Download a picture referenced by pasted HTML so it can be displayed.
 
@@ -4172,6 +4355,21 @@ class CommentEditor(QTextEdit):
         self.setTextCursor(cursor)
         return True
 
+    def restore_image(self, name, path):
+        """Make a picture saved in the draft folder drawable again.
+
+        toHtml() keeps only the image's file name, so a document reloaded from
+        a draft has nothing to paint until the file is registered under that
+        name, exactly as insertImage() does when the picture is pasted.
+        """
+        image = QtGui.QImage(path)
+        if image.isNull():
+            return False
+        self.document().addResource(
+            QtGui.QTextDocument.ResourceType.ImageResource, QUrl(name), image
+        )
+        return True
+
     def image_names(self):
         """File names of the pictures currently in the document.
 
@@ -4293,7 +4491,7 @@ class ScheduleCommentWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, user_data, work_item_id, due_at, body, image_paths,
-                 parent=None, body_html="", target_label="", target_url=""):
+                 parent=None, body_html=""):
         super().__init__(parent)
         self.user_data = user_data
         self.work_item_id = work_item_id
@@ -4301,8 +4499,6 @@ class ScheduleCommentWorker(QThread):
         self.body = body
         self.body_html = body_html
         self.image_paths = image_paths or []
-        self.target_label = target_label or DEFAULT_TFS_TARGET
-        self.target_url = target_url or org_url
 
     def run(self):
         try:
@@ -4317,8 +4513,7 @@ class ScheduleCommentWorker(QThread):
             image_urls = []
             for index, path in enumerate(self.image_paths, 1):
                 self.progress.emit(f"Uploading image {index}/{len(self.image_paths)}...")
-                url = _upload_comment_image(pat, self.work_item_id, path,
-                                            self.target_url)
+                url = _upload_comment_image(pat, self.work_item_id, path)
                 image_urls.append(url)
                 uploads[os.path.basename(path)] = url
 
@@ -4338,10 +4533,6 @@ class ScheduleCommentWorker(QThread):
                 "owner_uid": self.user_data.get("uid", ""),
                 "owner_email": self.user_data.get("email", ""),
                 "work_item_id": str(self.work_item_id),
-                # Which project this comment belongs to. The worker refuses a
-                # URL that is not in its own allowlist.
-                "tfs_target": self.target_label,
-                "tfs_org_url": self.target_url,
                 "due_at": self.due_at,
                 "body_text": body_text,
                 "html": html,
@@ -4371,8 +4562,8 @@ class ScheduleCommentWorker(QThread):
                                    self.user_data.get("uid", ""))
 
             doc_id = _fs_create(SCHEDULED_COMMENTS_COLLECTION, token, values)
-            logger.info("Scheduled comment saved: doc=%s wi=%s target=%s due=%s",
-                        doc_id, self.work_item_id, self.target_label, self.due_at)
+            logger.info("Scheduled comment saved: doc=%s wi=%s due=%s",
+                        doc_id, self.work_item_id, self.due_at)
             self.saved.emit(doc_id)
         except Exception as e:
             logger.exception("Could not save the scheduled comment")
@@ -4406,80 +4597,204 @@ class ScheduledCommentsListWorker(QThread):
             self.failed.emit(str(e))
 
 
-def _parse_utc(text):
-    """Firestore timestamp ('2026-11-06T12:00:00Z') -> aware datetime, or None."""
-    raw = str(text or "").strip()
-    if not raw:
-        return None
-    try:
-        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+class DeleteSchedulesWorker(QThread):
+    """Deletes a batch of schedules, one request at a time.
 
-
-def _ago(seconds):
-    """'4s ago', '3m ago', '2h 5m ago' - short enough for one line."""
-    seconds = int(seconds or 0)
-    if seconds < 90:
-        return f"{seconds}s ago"
-    minutes = seconds // 60
-    if minutes < 90:
-        return f"{minutes}m ago"
-    hours, minutes = divmod(minutes, 60)
-    if hours < 48:
-        return f"{hours}h {minutes}m ago"
-    return f"{hours // 24}d ago"
-
-
-class WorkerStatusWorker(QThread):
-    """Reads the hosted worker's heartbeat from Firestore.
-
-    A panel host (bot-hosting.net, Pterodactyl) usually exposes no public HTTP
-    port, so polling the worker directly would report "offline" for a worker
-    that is running fine. It already has Firestore access, so it writes a
-    heartbeat document on every poll and this reads the newest one.
+    The deletes used to run on the GUI thread, so a slow Firestore call froze
+    the dialog - indistinguishable from the app hanging. Here the requests run
+    off the GUI thread and every row reports back, so the panel can show that
+    work is happening rather than looking stuck.
     """
-    loaded = pyqtSignal(object)   # dict: online, known, seconds, projects, pending
+
+    progress = pyqtSignal(int, int)          # done, total
+    done = pyqtSignal(object, object)        # deleted docs, [(doc, error)]
+
+    def __init__(self, documents, user_data, parent=None):
+        super().__init__(parent)
+        self.documents = list(documents)
+        self.user_data = dict(user_data or {})
+
+    def run(self):
+        token = (_refresh_id_token(self.user_data)
+                 or self.user_data.get("id_token", ""))
+        deleted = []
+        failed = []
+        total = len(self.documents)
+        for index, doc in enumerate(self.documents, start=1):
+            try:
+                _fs_delete(SCHEDULED_COMMENTS_COLLECTION, doc.get("id", ""), token)
+                deleted.append(doc)
+                logger.info("Scheduled comment deleted: %s (status=%s)",
+                            doc.get("id"), doc.get("status") or "?")
+            except Exception as e:
+                logger.exception("Could not delete the schedule %s", doc.get("id"))
+                failed.append((doc, str(e)))
+            self.progress.emit(index, total)
+        self.done.emit(deleted, failed)
+
+
+def _comment_plain_text(html):
+    """Readable text for the plain-text half of the clipboard.
+
+    Pictures are dropped (they ride along in the HTML half), list items become
+    "\u2022" lines and <br> becomes a newline, so a paste into a plain text field
+    still reads like the comment.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    for img in soup.find_all("img"):
+        img.decompose()
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+    for item in soup.find_all("li"):
+        item.insert_before("\u2022 ")
+    text = soup.get_text()
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+class CopyCommentWorker(QThread):
+    """Puts a saved comment on the clipboard, pictures and all.
+
+    Firestore keeps only the comment HTML and the URLs of its attachments, and
+    which of those the paste target understands decides the mode:
+
+    * ``embed_pictures=True`` downloads each picture (with the same PAT the
+      editor uses) and writes it into the HTML as a data URI, so the clipboard
+      is self-contained - Word, Docs and chat windows get the pixels.
+    * ``embed_pictures=False`` leaves the attachment URLs alone and also
+      writes the pictures to disk so they can ride on the clipboard as files.
+      The TFS comment editor drops every ``<img>`` out of pasted HTML, but it
+      uploads picture files the way it uploads a pasted screenshot.
+
+    Read-only: it never writes to Firestore or TFS, so a pending schedule is
+    untouched.
+    """
+
+    # html, text, pictures, missing, files (paths for TFS to upload)
+    ready = pyqtSignal(str, str, int, int, list)
     failed = pyqtSignal(str)
 
-    def __init__(self, user_data, parent=None):
+    _MIME_BY_FORMAT = {
+        "PNG": "image/png", "JPEG": "image/jpeg", "GIF": "image/gif",
+        "BMP": "image/bmp", "TIFF": "image/tiff", "WEBP": "image/webp",
+    }
+
+    def __init__(self, document, pat, embed_pictures=True, parent=None):
         super().__init__(parent)
-        self.user_data = user_data
+        self.document = dict(document or {})
+        self.pat = pat or ""
+        self.embed_pictures = embed_pictures
+
+    def _html(self):
+        html = str(self.document.get("html", "") or "").strip()
+        if html:
+            return html
+        # Schedules saved before rich text only have the plain body.
+        text = str(self.document.get("body_text", "") or "").strip()
+        if not text:
+            raise RuntimeError("That schedule has no comment to copy.")
+        return "<br>".join(
+            _linkify_escaped(_escape_comment_text(line))
+            for line in re.split(r"\r\n|\r|\n", text)
+        )
+
+    @classmethod
+    def _mime(cls, payload):
+        try:
+            with Image.open(BytesIO(payload)) as probe:
+                return cls._MIME_BY_FORMAT.get(
+                    (probe.format or "").upper(), "image/png"
+                )
+        except Exception:
+            return "image/png"
+
+    def _stage_files(self, images):
+        """Download each picture to a file and return the paths that worked."""
+        _clear_clipboard_files()
+        directory = _clipboard_directory()
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError:
+            logger.exception("Could not create %s", directory)
+            return []
+
+        extensions = {
+            "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+            "image/bmp": ".bmp", "image/tiff": ".tiff",
+            "image/webp": ".webp",
+        }
+        paths = []
+        for index, image in enumerate(images, 1):
+            src = (image.get("src") or "").strip()
+            if not src or src.startswith("data:"):
+                continue
+            try:
+                payload = _fetch_image_bytes(src, self.pat)
+                suffix = extensions.get(self._mime(payload), ".png")
+                path = os.path.join(directory, f"picture-{index}{suffix}")
+                with open(path, "wb") as handle:
+                    handle.write(payload)
+                paths.append(path)
+            except Exception as e:
+                logger.warning(
+                    "Could not stage a picture for the TFS clipboard: %s", e
+                )
+        return paths
 
     def run(self):
         try:
-            token = _refresh_id_token(self.user_data) or self.user_data.get("id_token", "")
-            if not token:
-                self.failed.emit("not signed in")
-                return
-            documents = _fs_query(WORKER_STATUS_COLLECTION, token, limit=20)
+            html = self._html()
+            soup = BeautifulSoup(html, "html.parser")
+            images = soup.find_all("img")
+            if not images:
+                # A comment saved without rich text still lists its uploads.
+                container = soup.body or soup
+                for url in str(self.document.get("image_urls", "")).splitlines():
+                    if url.strip():
+                        image = soup.new_tag("img", src=url.strip())
+                        container.append(image)
+                        images.append(image)
 
-            newest = None
-            for doc in documents:
-                seen = _parse_utc(doc.get("last_seen"))
-                if seen is None:
+            if not self.embed_pictures:
+                # The stored attachment URLs are kept as they are, and the
+                # pictures are also staged as real files: TFS's comment editor
+                # drops <img> out of pasted HTML but uploads picture files the
+                # way it uploads a pasted screenshot.
+                files = self._stage_files(images)
+                copied = str(soup)
+                self.ready.emit(
+                    copied, _comment_plain_text(copied), len(images),
+                    max(len(images) - len(files), 0), files,
+                )
+                return
+
+            embedded = 0
+            missing = 0
+            for image in images:
+                src = (image.get("src") or "").strip()
+                if not src or src.startswith("data:"):
                     continue
-                if newest is None or seen > newest[0]:
-                    newest = (seen, doc)
+                try:
+                    payload = _fetch_image_bytes(src, self.pat)
+                    encoded = base64.b64encode(payload).decode("ascii")
+                    image["src"] = (
+                        f"data:{self._mime(payload)};base64,{encoded}"
+                    )
+                    embedded += 1
+                except Exception as e:
+                    # The URL is left in place: the comment still copies, and
+                    # the original attachment keeps working.
+                    missing += 1
+                    logger.warning(
+                        "Could not fetch a picture for the clipboard: %s", e
+                    )
 
-            if newest is None:
-                self.loaded.emit({"online": False, "known": False,
-                                  "seconds": None, "projects": "",
-                                  "pending": 0})
-                return
-
-            seen, doc = newest
-            seconds = max(0, int((datetime.now(timezone.utc) - seen).total_seconds()))
-            self.loaded.emit({
-                "online": seconds <= WORKER_ONLINE_SECONDS,
-                "known": True,
-                "seconds": seconds,
-                "projects": str(doc.get("projects") or ""),
-                "pending": doc.get("pending") or 0,
-            })
+            copied = str(soup)
+            self.ready.emit(
+                copied, _comment_plain_text(copied), embedded, missing, []
+            )
         except Exception as e:
-            logger.warning("Worker status check failed: %s", e)
+            logger.exception("Could not copy the scheduled comment")
             self.failed.emit(str(e))
 
 
@@ -4498,6 +4813,17 @@ class ScheduledCommentDialog(QDialog):
         self._documents = []
         self._save_worker = None
         self._list_worker = None
+        self._copy_worker = None
+        self._delete_worker = None
+        self._copy_embed = True
+
+        # An unfinished comment is kept on disk: a mis-clicked close, a crash
+        # or a Windows update must not cost the text and the pictures that are
+        # already in the box. See _save_draft / _restore_draft.
+        self._draft_timer = QtCore.QTimer(self)
+        self._draft_timer.setSingleShot(True)
+        self._draft_timer.setInterval(700)
+        self._draft_timer.timeout.connect(self._save_draft)
 
         self.setWindowTitle("Scheduled Comment")
         self.setObjectName("ScheduledComment")
@@ -4505,8 +4831,8 @@ class ScheduledCommentDialog(QDialog):
         self.setStyleSheet(self._style())
 
         # Compose on the left, saved schedules down the right-hand side: the
-        # list is a reference you glance at while writing, not something to
-        # scroll past to reach the buttons.
+        # list is a reference you glance at while writing, and its rows carry
+        # their own right-click actions.
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(18)
@@ -4526,34 +4852,14 @@ class ScheduledCommentDialog(QDialog):
         subtitle.setStyleSheet("font-size: 12px; color: #6b7280;")
         compose.addWidget(subtitle)
 
-        # Whether a worker is actually polling the queue. Without this a
-        # schedule saves happily into a host that has been down for days and
-        # nothing explains why the comment never appears.
-        status_row = QtWidgets.QHBoxLayout()
-        status_row.setSpacing(8)
-        self.worker_status_label = QtWidgets.QLabel("Checking whether a worker is online...")
-        self.worker_status_label.setWordWrap(True)
-        self.worker_status_label.setStyleSheet("font-size: 12px; color: #6b7280;")
-        status_row.addWidget(self.worker_status_label, stretch=1)
-        self.worker_check_btn = QPushButton("Check")
-        self.worker_check_btn.setObjectName("ghost")
-        self.worker_check_btn.clicked.connect(self.refresh_worker_status)
-        status_row.addWidget(self.worker_check_btn)
-        compose.addLayout(status_row)
-
         form = QtWidgets.QFormLayout()
         form.setSpacing(8)
         form.setContentsMargins(0, 6, 0, 6)
 
-        self.target_input = QComboBox()
-        for label, url in TFS_TARGETS:
-            self.target_input.addItem(label, url)
-        self.target_input.setMaximumWidth(240)
-        form.addRow("Project:", self.target_input)
-
         self.work_item_input = QLineEdit()
         self.work_item_input.setPlaceholderText("e.g. 123456")
         self.work_item_input.setMaximumWidth(240)
+        self.work_item_input.textChanged.connect(self._schedule_draft_save)
         form.addRow("Work Item ID:", self.work_item_input)
 
         self.when_input = QtWidgets.QDateTimeEdit(
@@ -4562,6 +4868,7 @@ class ScheduledCommentDialog(QDialog):
         self.when_input.setCalendarPopup(True)
         self.when_input.setDisplayFormat("MM/dd/yyyy hh:mm AP")
         self.when_input.setMaximumWidth(240)
+        self.when_input.dateTimeChanged.connect(self._schedule_draft_save)
         form.addRow("Post at (local time):", self.when_input)
 
         compose.addLayout(form)
@@ -4642,7 +4949,29 @@ class ScheduledCommentDialog(QDialog):
 
         self.list_view = QtWidgets.QListWidget()
         self.list_view.setObjectName("scheduleList")
+        # Shift-click selects a range and Ctrl-click picks rows out of one, so
+        # a batch of old schedules can be deleted in a single go.
+        self.list_view.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        # Copy and delete live on the rows themselves: right-click a schedule.
+        self.list_view.setContextMenuPolicy(
+            QtCore.Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.list_view.customContextMenuRequested.connect(
+            self._show_schedule_menu
+        )
         side_layout.addWidget(self.list_view, stretch=1)
+
+        # Runs while a copy, delete or refresh is in flight: a few Firestore
+        # round-trips look like a frozen window otherwise.
+        self.busy_bar = QtWidgets.QProgressBar()
+        self.busy_bar.setObjectName("busyBar")
+        self.busy_bar.setRange(0, 0)          # indeterminate: no known length
+        self.busy_bar.setTextVisible(False)
+        self.busy_bar.setFixedHeight(4)
+        self.busy_bar.setVisible(False)
+        side_layout.addWidget(self.busy_bar)
 
         # List messages belong to the list, not to the compose area.
         self.list_status = QtWidgets.QLabel("")
@@ -4650,22 +4979,18 @@ class ScheduledCommentDialog(QDialog):
         self.list_status.setStyleSheet("font-size: 11.5px; color: #6b7280;")
         side_layout.addWidget(self.list_status)
 
-        self.cancel_btn = QPushButton("Cancel selected")
-        self.cancel_btn.setObjectName("ghost")
-        self.cancel_btn.clicked.connect(self.cancel_selected)
-        side_layout.addWidget(self.cancel_btn)
+        hint = QtWidgets.QLabel(
+            "Right-click a schedule to copy or delete it. Shift-click or "
+            "Ctrl-click to select several."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size: 11.5px; color: #6b7280;")
+        side_layout.addWidget(hint)
 
         layout.addWidget(side)
 
-        self._status_worker = None
-        self._worker_status = None
-        self._status_timer = QTimer(self)
-        self._status_timer.setInterval(30000)
-        self._status_timer.timeout.connect(self.refresh_worker_status)
-        self._status_timer.start()
-
         self.refresh_list()
-        self.refresh_worker_status()
+        self._restore_draft()
         self.showMaximized()
 
     def _style(self):
@@ -4697,15 +5022,23 @@ class ScheduledCommentDialog(QDialog):
             }
             QListWidget#scheduleList {
                 background: transparent; border: none; padding: 0px;
+                outline: none;
             }
             QListWidget#scheduleList::item {
-                padding: 7px 8px; border-radius: 8px; color: #c9d4de;
+                padding: 7px 10px;
+                border-radius: 8px;
+                border-left: 3px solid transparent;
+                color: #c9d4de;
             }
             QListWidget#scheduleList::item:hover {
-                background: rgba(255,255,255,0.05);
+                background: rgba(255,255,255,0.06);
             }
             QListWidget#scheduleList::item:selected {
-                background: rgba(237,59,59,0.20); color: #ffffff;
+                border-left: 3px solid #ed3b3b;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(237,59,59,0.34),
+                    stop:1 rgba(237,59,59,0.06));
+                color: #ffffff;
             }
             QPushButton {
                 background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
@@ -4727,6 +5060,24 @@ class ScheduledCommentDialog(QDialog):
             QPushButton#ghost:disabled {
                 background: transparent; color: #98a0a6;
                 border-color: rgba(255,255,255,0.08);
+            }
+            QProgressBar {
+                background: rgba(255,255,255,0.08); border: none;
+                border-radius: 2px;
+            }
+            QProgressBar::chunk { background: #ed3b3b; border-radius: 2px; }
+            QMenu {
+                background: #16232f; color: #e6eef5;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 10px; padding: 6px;
+            }
+            QMenu::item { padding: 7px 18px; border-radius: 7px; }
+            QMenu::item:selected {
+                background: rgba(237,59,59,0.25); color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px; background: rgba(255,255,255,0.10);
+                margin: 5px 8px;
             }
             """
         return """
@@ -4753,15 +5104,23 @@ class ScheduledCommentDialog(QDialog):
         }
         QListWidget#scheduleList {
             background: transparent; border: none; padding: 0px;
+            outline: none;
         }
         QListWidget#scheduleList::item {
-            padding: 7px 8px; border-radius: 8px; color: #374151;
+            padding: 7px 10px;
+            border-radius: 8px;
+            border-left: 3px solid transparent;
+            color: #374151;
         }
         QListWidget#scheduleList::item:hover {
-            background: rgba(17,24,39,0.04);
+            background: rgba(17,24,39,0.05);
         }
         QListWidget#scheduleList::item:selected {
-            background: rgba(237,59,59,0.12); color: #111827;
+            border-left: 3px solid #ed3b3b;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 rgba(237,59,59,0.20),
+                stop:1 rgba(237,59,59,0.03));
+            color: #111827;
         }
         QPushButton {
             background: #ed3b3b; color: white; border-radius: 10px;
@@ -4776,6 +5135,22 @@ class ScheduledCommentDialog(QDialog):
         QPushButton:disabled { background: #d1d5db; color: #6b7280; }
         QPushButton#ghost:disabled {
             background: transparent; color: #9ca3af; border-color: #e5e7eb;
+        }
+        QProgressBar {
+            background: #e5e7eb; border: none; border-radius: 2px;
+        }
+        QProgressBar::chunk { background: #ed3b3b; border-radius: 2px; }
+        QMenu {
+            background: #ffffff; color: #111827;
+            border: 1px solid #e5e7eb;
+            border-radius: 10px; padding: 6px;
+        }
+        QMenu::item { padding: 7px 18px; border-radius: 7px; }
+        QMenu::item:selected {
+            background: rgba(237,59,59,0.12); color: #111827;
+        }
+        QMenu::separator {
+            height: 1px; background: #e5e7eb; margin: 5px 8px;
         }
         """
 
@@ -4792,6 +5167,7 @@ class ScheduledCommentDialog(QDialog):
         if path and path not in self.image_paths:
             self.image_paths.append(path)
             self._update_images_label()
+            self._schedule_draft_save()
 
     def _on_editor_changed(self):
         """Re-check the attachments once the edit that caused this is done.
@@ -4800,6 +5176,7 @@ class ScheduledCommentDialog(QDialog):
         so pruning immediately could drop an attachment that is still there.
         """
         QtCore.QTimer.singleShot(0, self._sync_pasted_images)
+        self._schedule_draft_save()
 
     def _sync_pasted_images(self):
         """Keep the attachments to the pictures still in the box.
@@ -4815,6 +5192,115 @@ class ScheduledCommentDialog(QDialog):
         if len(kept) != len(self.image_paths):
             self.image_paths = kept
             self._update_images_label()
+            self._schedule_draft_save()
+
+    # --- local draft ---
+
+    def _schedule_draft_save(self):
+        """Save shortly after the typing stops, not on every keystroke."""
+        if _ui_alive(self.body_input):
+            self._draft_timer.start()
+
+    def _save_draft(self):
+        """Keep a local copy of the comment that has not been scheduled yet.
+
+        Until Schedule Comment is pressed Firestore has never seen this text,
+        so this folder is the only copy: the editor HTML plus a real copy of
+        every picture, because the ones in the temp folder can be cleaned up
+        by Windows while the app is closed.
+        """
+        if not _ui_alive(self.body_input):
+            return
+        try:
+            html = self.body_input.toHtml()
+            names = self.body_input.image_names()
+            paths = [p for p in self.image_paths
+                     if os.path.basename(p) in names and os.path.exists(p)]
+
+            # An empty box means there is nothing to come back to.
+            if not self.body_input.toPlainText().strip() and not paths:
+                _clear_scheduled_draft()
+                return
+
+            directory = _draft_directory()
+            os.makedirs(directory, exist_ok=True)
+            kept = set()
+            for path in paths:
+                name = os.path.basename(path)
+                target = os.path.join(directory, name)
+                kept.add(name)
+                if (os.path.abspath(path) != os.path.abspath(target)
+                        and not os.path.exists(target)):
+                    shutil.copy2(path, target)
+
+            # Pictures deleted from the box, or left behind by a save that
+            # never finished, must not pile up in the draft folder.
+            for name in os.listdir(directory):
+                if name == _DRAFT_FILE or name in kept:
+                    continue
+                try:
+                    os.remove(os.path.join(directory, name))
+                except OSError:
+                    pass
+
+            draft = {
+                "body_html": html,
+                "work_item_id": self.work_item_input.text().strip(),
+                "when": self.when_input.dateTime().toString(
+                    "yyyy-MM-ddTHH:mm:ss"
+                ),
+                "images": sorted(kept),
+                "saved_at": _utc_now_iso(),
+            }
+            target = os.path.join(directory, _DRAFT_FILE)
+            temporary = target + ".tmp"
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(draft, handle)
+            os.replace(temporary, target)
+        except OSError:
+            logger.warning("Could not save the scheduled comment draft",
+                           exc_info=True)
+
+    def _restore_draft(self):
+        """Bring back the comment the previous session never finished."""
+        draft = _load_scheduled_draft()
+        if not draft:
+            return
+        html = str(draft.get("body_html", "") or "").strip()
+        if not html:
+            return
+
+        # setHtml() alone cannot draw the pictures: it only knows their file
+        # names, so each one is loaded from the draft folder under that name.
+        self.body_input.setHtml(html)
+        directory = _draft_directory()
+        paths = []
+        for name in self.body_input.image_names():
+            candidate = os.path.join(directory, name)
+            if self.body_input.restore_image(name, candidate):
+                paths.append(candidate)
+        self.image_paths = paths
+        self._update_images_label()
+
+        work_item_id = str(draft.get("work_item_id", "") or "").strip()
+        if work_item_id:
+            self.work_item_input.setText(work_item_id)
+
+        # A draft left overnight would fail "pick a time in the future", so a
+        # time that has passed moves to now + 10 minutes.
+        when = QtCore.QDateTime.fromString(
+            str(draft.get("when", "") or ""), "yyyy-MM-ddTHH:mm:ss"
+        )
+        if when.isValid() and when < QtCore.QDateTime.currentDateTime():
+            when = QtCore.QDateTime.currentDateTime().addSecs(600)
+        if when.isValid():
+            self.when_input.setDateTime(when)
+
+        self.status_label.setText(
+            "Restored your unfinished comment and its pictures from last time."
+        )
+        logger.info("Restored the scheduled comment draft (%d picture(s))",
+                    len(paths))
 
     def _update_images_label(self):
         if not self.image_paths:
@@ -4851,30 +5337,6 @@ class ScheduledCommentDialog(QDialog):
             return
         due_utc = local_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        target_label = self.target_input.currentText() or DEFAULT_TFS_TARGET
-        target_url = self.target_input.currentData() or org_url
-
-        # Saving is harmless but useless while nothing is polling the queue, so
-        # say it once and let the person decide rather than blocking them.
-        status = self._worker_status
-        if status is not None and not status.get("online"):
-            if status.get("known"):
-                detail = ("The last worker heartbeat was "
-                          f"{_ago(status.get('seconds'))}.")
-            else:
-                detail = "No worker has written a heartbeat yet."
-            answer = QMessageBox.question(
-                self,
-                "Worker offline",
-                f"{detail}\n\nThe comment will stay queued until a worker is "
-                "running - nothing will post it until then.\n\n"
-                "Schedule it anyway?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-
         self._set_busy(True)
         self.status_label.setText("Uploading and saving...")
 
@@ -4882,7 +5344,6 @@ class ScheduledCommentDialog(QDialog):
             self.user_data, work_item_id, due_utc, body,
             list(self.image_paths), self,
             body_html=self.body_input.toHtml(),
-            target_label=target_label, target_url=target_url,
         )
         self._save_worker.progress.connect(self.status_label.setText)
         self._save_worker.saved.connect(self._on_saved)
@@ -4890,7 +5351,7 @@ class ScheduledCommentDialog(QDialog):
         self._save_worker.start()
 
     def _set_busy(self, busy):
-        for widget in (self.schedule_btn, self.refresh_btn, self.cancel_btn):
+        for widget in (self.schedule_btn, self.refresh_btn):
             if _ui_alive(widget):
                 widget.setEnabled(not busy)
         if _ui_alive(self.schedule_btn):
@@ -4904,6 +5365,7 @@ class ScheduledCommentDialog(QDialog):
         )
         self.body_input.clear()
         self.clear_images()
+        _clear_scheduled_draft()
         self.refresh_list()
 
     def _on_failed(self, message):
@@ -4911,83 +5373,30 @@ class ScheduledCommentDialog(QDialog):
         logger.warning("Scheduling failed: %s", message)
         self.status_label.setText(f"Could not schedule: {message}")
 
-    # --- worker status ---
-
-    def refresh_worker_status(self):
-        """Ask Firestore for the newest worker heartbeat."""
-        if not self.user_data.get("uid"):
-            self.worker_status_label.setText("Worker status: not signed in.")
-            return
-        # One check at a time: the timer fires again 30s later regardless.
-        if self._status_worker is not None and self._status_worker.isRunning():
-            return
-        if _ui_alive(self.worker_check_btn):
-            self.worker_check_btn.setEnabled(False)
-        self._status_worker = WorkerStatusWorker(self.user_data, self)
-        self._status_worker.loaded.connect(self._on_worker_status)
-        self._status_worker.failed.connect(self._on_worker_status_failed)
-        self._status_worker.start()
-
-    def _on_worker_status(self, status):
-        self._worker_status = status
-        if _ui_alive(self.worker_check_btn):
-            self.worker_check_btn.setEnabled(True)
-        if not _ui_alive(self.worker_status_label):
-            return
-
-        if status.get("online"):
-            projects = status.get("projects") or "project list unknown"
-            text = (f"Worker online \u00b7 {projects} \u00b7 heartbeat "
-                    f"{_ago(status.get('seconds'))}")
-            color = "#16a34a"
-        elif status.get("known"):
-            text = ("Worker offline \u00b7 last heartbeat "
-                    f"{_ago(status.get('seconds'))} - scheduled comments will "
-                    "wait until it is back")
-            color = "#dc2626"
-        else:
-            text = ("Worker status unknown \u00b7 no heartbeat recorded yet - "
-                    "is the worker running?")
-            color = "#d97706"
-        self.worker_status_label.setText(text)
-        self.worker_status_label.setStyleSheet(
-            f"font-size: 12px; font-weight: 600; color: {color};"
-        )
-
-    def _on_worker_status_failed(self, message):
-        if _ui_alive(self.worker_check_btn):
-            self.worker_check_btn.setEnabled(True)
-        if not _ui_alive(self.worker_status_label):
-            return
-        self._worker_status = None
-        # A 403 here always means the workerStatus rules are missing or were
-        # never published - say so rather than leaving the raw message alone.
-        hint = ""
-        lowered = (message or "").lower()
-        if "refused" in lowered or "insufficient permissions" in lowered \
-                or "expired" in lowered:
-            hint = (" - add the workerStatus rules from the README and press "
-                    "Publish in Firestore")
-        self.worker_status_label.setText(
-            f"Worker status unknown \u00b7 could not check ({message}){hint}"
-        )
-        self.worker_status_label.setStyleSheet(
-            "font-size: 12px; font-weight: 600; color: #d97706;"
-        )
-
-    def closeEvent(self, event):
-        # The dialog is about to be destroyed; stop the periodic check first.
-        if getattr(self, "_status_timer", None) is not None:
-            self._status_timer.stop()
-        super().closeEvent(event)
-
     # --- saved schedules ---
+
+    def _set_list_busy(self, busy, message=None):
+        """Show that the panel is working, not hanging.
+
+        Copying a comment (which may download pictures), deleting rows and
+        loading the list all talk to Firestore, so each one can take a few
+        seconds. The bar runs meanwhile and the list and Refresh button are
+        locked: a second action started mid-flight would fight the first for
+        the same rows.
+        """
+        if _ui_alive(self.busy_bar):
+            self.busy_bar.setVisible(busy)
+        for widget in (self.list_view, self.refresh_btn):
+            if _ui_alive(widget):
+                widget.setEnabled(not busy)
+        if message is not None and _ui_alive(self.list_status):
+            self.list_status.setText(message)
 
     def refresh_list(self):
         if not self.user_data.get("uid"):
-            self.list_status.setText("Not signed in.")
+            self._set_list_busy(False, "Not signed in.")
             return
-        self.list_status.setText("Loading schedules...")
+        self._set_list_busy(True, "Loading schedules...")
         self._list_worker = ScheduledCommentsListWorker(self.user_data, self)
         self._list_worker.loaded.connect(self._on_list_loaded)
         self._list_worker.failed.connect(self._on_list_failed)
@@ -5001,13 +5410,14 @@ class ScheduledCommentDialog(QDialog):
             item.setSizeHint(QtCore.QSize(0, 52))
             self.list_view.addItem(item)
         if not self._documents:
-            self.list_status.setText("No scheduled comments yet.")
+            note = "No scheduled comments yet."
         else:
-            self.list_status.setText(f"{len(self._documents)} schedule(s)")
+            note = f"{len(self._documents)} schedule(s)"
+        self._set_list_busy(False, note)
 
     def _on_list_failed(self, message):
         logger.warning("Could not load schedules: %s", message)
-        self.list_status.setText(f"Could not load schedules: {message}")
+        self._set_list_busy(False, f"Could not load schedules: {message}")
 
     def _summary(self, doc):
         """Ticket number and the time it goes out - nothing else.
@@ -5015,47 +5425,241 @@ class ScheduledCommentDialog(QDialog):
         A body preview made every row hard to scan; the panel is for spotting
         which ticket is queued and when, not for reading the comments.
         """
+        return f"WI {doc.get('work_item_id', '?')}\n{self._due_text(doc)}"
+
+    def _due_text(self, doc):
+        """The schedule's due time in local time, as shown in the list."""
         due = str(doc.get("due_at", ""))
         try:
             local = datetime.strptime(due, "%Y-%m-%dT%H:%M:%SZ").replace(
                 tzinfo=timezone.utc
             ).astimezone()
-            when = local.strftime("%m/%d/%Y %I:%M %p")
+            return local.strftime("%m/%d/%Y %I:%M %p")
         except (TypeError, ValueError):
-            when = due or "?"
-        target = str(doc.get("tfs_target") or "").strip()
-        suffix = f" \u00b7 {target}" if target and target != DEFAULT_TFS_TARGET else ""
-        return f"WI {doc.get('work_item_id', '?')}{suffix}\n{when}"
+            return due or "?"
 
-    def cancel_selected(self):
-        row = self.list_view.currentRow()
-        if row < 0 or row >= len(self._documents):
-            self.list_status.setText("Select a schedule to cancel.")
+    def _is_future(self, doc):
+        """True while the schedule's due time has not arrived yet.
+
+        Unreadable timestamps are not treated as future: they cannot be
+        posted, so holding on to them would leave a row nobody can remove.
+        """
+        try:
+            due = datetime.strptime(
+                str(doc.get("due_at", "")), "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return False
+        return due >= datetime.now(timezone.utc)
+
+    def _selected_docs(self):
+        """The schedules behind the highlighted rows, in list order."""
+        rows = sorted(self.list_view.row(item)
+                      for item in self.list_view.selectedItems())
+        return [self._documents[r] for r in rows
+                if 0 <= r < len(self._documents)]
+
+    def _show_schedule_menu(self, pos):
+        """Right-click menu for the highlighted schedules.
+
+        A right-click inside an existing highlight keeps it, so one row can be
+        dropped from a batch; anywhere else selects just the row under the
+        cursor, which is what a right-click on a fresh row means.
+        """
+        item = self.list_view.itemAt(pos)
+        if item is None:
+            return
+        if not item.isSelected():
+            self.list_view.clearSelection()
+            item.setSelected(True)
+            self.list_view.setCurrentItem(item)
+
+        count = len(self._selected_docs())
+
+        menu = QtWidgets.QMenu(self.list_view)
+        menu.setObjectName("scheduleMenu")
+        copy_tfs = menu.addAction("Copy for TFS")
+        copy_tfs.setToolTip(
+            "Paste into the TFS comment box: pictures go on the clipboard as "
+            "files, which is the only image form that editor keeps."
+        )
+        copy_general = menu.addAction("Copy for general")
+        copy_general.setToolTip(
+            "Paste into Word, Docs or a chat window: pictures are embedded in "
+            "the copied HTML."
+        )
+        # The clipboard holds one comment, so copying needs exactly one row.
+        for action in (copy_tfs, copy_general):
+            action.setEnabled(count == 1)
+        menu.addSeparator()
+        delete = menu.addAction(
+            "Delete schedule" if count <= 1 else f"Delete {count} schedules"
+        )
+
+        chosen = menu.exec(self.list_view.viewport().mapToGlobal(pos))
+        if chosen is copy_tfs:
+            self.copy_selected(embed_pictures=False)
+        elif chosen is copy_general:
+            self.copy_selected(embed_pictures=True)
+        elif chosen is delete:
+            self.cancel_selected()
+
+    def copy_selected(self, embed_pictures=True):
+        """Put the selected schedule's comment on the clipboard.
+
+        Two flavours, because paste targets disagree about pictures:
+
+        * embed_pictures=False - leave the attachment URLs the comment was
+          saved with and stage the pictures as files. The TFS comment editor
+          ignores <img> in pasted HTML and strips data URIs, but it uploads
+          picture files the way it uploads a pasted screenshot, so this is the
+          one that lands in a ticket with its pictures.
+        * embed_pictures=True - download the pictures and inline them, so the
+          clipboard is self-contained for Word, Docs, chat and so on.
+
+        Both only read: no schedule document is written. One row only - the
+        clipboard has room for a single comment.
+        """
+        if self._copy_worker is not None and self._copy_worker.isRunning():
+            self.list_status.setText("Still copying - give it a second.")
             return
 
-        doc = self._documents[row]
-        if str(doc.get("status", "")) in ("sent", "sending"):
+        docs = self._selected_docs()
+        if len(docs) != 1:
+            self.list_status.setText(
+                "Select one schedule to copy." if docs
+                else "Right-click a schedule to copy it."
+            )
+            return
+
+        self._copy_embed = embed_pictures
+        self._set_list_busy(
+            True,
+            "Copying the comment and its pictures..." if embed_pictures
+            else "Copying the comment and preparing its pictures...",
+        )
+
+        self._copy_worker = CopyCommentWorker(
+            docs[0], self.user_data.get("pat", ""),
+            embed_pictures, self
+        )
+        self._copy_worker.ready.connect(self._on_copied)
+        self._copy_worker.failed.connect(self._on_copy_failed)
+        self._copy_worker.start()
+
+    def _on_copied(self, html, text, pictures, missing, files):
+        mime = QtCore.QMimeData()
+        mime.setHtml(html)
+        mime.setText(text)
+        if files:
+            # The file list is what lets the TFS comment box upload the
+            # pictures itself, the same way it handles a pasted screenshot.
+            mime.setUrls([QtCore.QUrl.fromLocalFile(path) for path in files])
+        QtWidgets.QApplication.clipboard().setMimeData(mime)
+
+        if self._copy_embed:
+            note = (f"Comment copied with {pictures} embedded picture(s)."
+                    if pictures else "Comment copied.")
+            if missing:
+                note += f" {missing} picture(s) could not be downloaded."
+        else:
+            note = (f"Comment copied for TFS with {pictures} picture(s)."
+                    if pictures else "Comment copied for TFS.")
+            if missing:
+                note += f" {missing} picture(s) could not be read."
+        self._set_list_busy(False, note)
+        logger.info(
+            "Scheduled comment copied (%s): %d picture(s), %d missing",
+            "embedded" if self._copy_embed else "TFS links",
+            pictures, missing,
+        )
+
+    def _on_copy_failed(self, message):
+        logger.warning("Could not copy the scheduled comment: %s", message)
+        self._set_list_busy(False, f"Could not copy: {message}")
+
+    def cancel_selected(self):
+        """Delete every highlighted schedule, refusing the whole batch if any
+        of them is still in the future.
+
+        A schedule is deleted after its time has passed - it is either already
+        posted (deleting the record leaves the ticket comment alone) or the
+        worker has given up on it. Deleting a future one would silently cancel
+        a comment somebody is still waiting for, so the batch is refused and
+        the rows that caused it are named instead.
+        """
+        docs = self._selected_docs()
+        if not docs:
+            self.list_status.setText("Right-click a schedule to delete it.")
+            return
+
+        upcoming = [doc for doc in docs if self._is_future(doc)]
+        if upcoming:
+            rows = "\n".join(
+                f"\u2022 WI {doc.get('work_item_id', '?')} - {self._due_text(doc)}"
+                for doc in upcoming
+            )
+            one = len(upcoming) == 1
+            if len(upcoming) == len(docs):
+                tail = "Nothing else was selected, so nothing was deleted."
+            else:
+                tail = ("Deselect " + ("it" if one else "them")
+                        + " to delete the rest of the selection.")
             AppDialog(
-                "Cannot Cancel",
-                "That comment has already been sent or is being posted right now.",
+                "Cannot Delete",
+                ("Nothing was deleted. "
+                 + ("This schedule is" if one else f"These {len(upcoming)} schedules are")
+                 + " still in the future, and a schedule can only be deleted "
+                 "after its time has passed:\n\n" + rows + "\n\n" + tail),
                 self,
             ).exec()
             return
 
-        try:
-            token = _refresh_id_token(self.user_data) or self.user_data.get("id_token", "")
-            _fs_delete(SCHEDULED_COMMENTS_COLLECTION, doc.get("id", ""), token)
-            logger.info("Scheduled comment cancelled: %s", doc.get("id"))
-            self.list_status.setText("Schedule cancelled.")
-            self.refresh_list()
-        except Exception as e:
-            logger.exception("Could not cancel the schedule")
-            AppDialog("Error", f"Could not cancel: {e}", self).exec()
+        self._set_list_busy(
+            True,
+            "Deleting the schedule..." if len(docs) == 1
+            else f"Deleting {len(docs)} schedules...",
+        )
+        self._delete_worker = DeleteSchedulesWorker(docs, self.user_data, self)
+        self._delete_worker.progress.connect(self._on_delete_progress)
+        self._delete_worker.done.connect(self._on_deleted)
+        self._delete_worker.start()
+
+    def _on_delete_progress(self, done, total):
+        if _ui_alive(self.list_status):
+            self.list_status.setText(
+                f"Deleting {done} of {total}..." if total > 1
+                else "Deleting the schedule..."
+            )
+
+    def _on_deleted(self, deleted, failed):
+        total = len(deleted) + len(failed)
+        posted = sum(1 for doc in deleted
+                     if str(doc.get("status", "")) == "sent")
+        if failed:
+            rows = "\n".join(f"WI {doc.get('work_item_id', '?')}: {message}"
+                             for doc, message in failed)
+            AppDialog(
+                "Delete Failed",
+                (f"Deleted {len(deleted)} of {total} schedule(s).\n\n"
+                 "Could not delete:\n" + rows),
+                self,
+            ).exec()
+        if len(deleted) == 1:
+            note = ("Deleted. That comment was already posted, so the ticket "
+                    "keeps it." if posted else "Schedule deleted.")
+        elif deleted:
+            note = f"Deleted {len(deleted)} schedules."
+        else:
+            note = "Nothing was deleted."
+        self._set_list_busy(False, note)
+        self.refresh_list()
 
     # --- lifetime ---
 
     def _worker_running(self):
-        for worker in (self._save_worker, self._list_worker):
+        for worker in (self._save_worker, self._list_worker,
+                       self._copy_worker, self._delete_worker):
             if worker is not None and worker.isRunning():
                 return True
         return False
@@ -5065,6 +5669,9 @@ class ScheduledCommentDialog(QDialog):
         if self._worker_running():
             self.status_label.setText("Still working - give it a second.")
             return
+        # Whatever ends the dialog, the last edit is already on disk.
+        self._draft_timer.stop()
+        self._save_draft()
         super().reject()
 
     def closeEvent(self, event):
@@ -5072,7 +5679,1580 @@ class ScheduledCommentDialog(QDialog):
             event.ignore()
             self.status_label.setText("Still working - give it a second.")
             return
+        self._draft_timer.stop()
+        self._save_draft()
         super().closeEvent(event)
+
+
+# ================= PTU READING =================
+# The PTU tool reads a permit from a PDF or a picture. Two engines do the work:
+#   * a PDF's own text layer, via pypdf - exact and instant;
+#   * Windows OCR (Windows.Media.Ocr) for scans, photos and screenshots, which
+#     runs offline on the language packs already installed on the PC.
+# Both are optional imports: the app must still start - and the tool still open
+# with an explanation - on a machine where a build step skipped them.
+
+try:
+    from pypdf import PdfReader
+    _PDF_IMPORT_ERROR = ""
+except Exception as e:     # noqa: BLE001 - absence must not stop the app
+    PdfReader = None
+    _PDF_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+
+try:
+    import pypdfium2 as pdfium
+    _PDFIUM_IMPORT_ERROR = ""
+except Exception as e:     # noqa: BLE001
+    pdfium = None
+    _PDFIUM_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+
+# The reason is kept, not just a None: "OCR is not available" is useless on a
+# machine where the package is installed but a DLL did not load.
+try:
+    from winrt.windows.media.ocr import OcrEngine
+    from winrt.windows.graphics.imaging import BitmapDecoder
+    from winrt.windows.storage.streams import DataWriter, InMemoryRandomAccessStream
+    _OCR_IMPORT_ERROR = ""
+except Exception as e:     # noqa: BLE001
+    OcrEngine = None
+    _OCR_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+    logger.warning("Windows OCR unavailable: %s", _OCR_IMPORT_ERROR)
+
+PTU_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
+PTU_SUFFIXES = PTU_IMAGE_SUFFIXES | {".pdf"}
+PTU_MIN_TEXT_CHARS = 40          # below this many characters a page is a scan
+PTU_OCR_MAX_SIDE = 4000          # past this OCR is slower, not more accurate
+PTU_OCR_UPSCALE_BELOW = 1200     # small screenshots read better a little larger
+PTU_PDF_RENDER_SCALE = 2.0       # about 144 dpi: enough for 6-8 pt table text
+
+# The five header fields, with the label wording a permit actually uses and the
+# variants OCR returns. Order matters only for how they are listed in the UI.
+PTU_FIELD_SPECS = (
+    (
+        "proprietor",
+        "Proprietor",
+        r"granted\s+to|grantee|proprietor(?:'s)?\s+name|"
+        r"name\s+of\s+(?:the\s+)?(?:taxpayer|proprietor|owner)|"
+        r"taxpayer(?:'s)?\s+name|registered\s+owner",
+    ),
+    (
+        "business_name",
+        "Business Name",
+        r"business\s+name|trade\s+name(?:\s*/\s*business\s+name)?|"
+        r"name\s+of\s+(?:the\s+)?(?:business|establishment)|"
+        r"establishment(?:'s)?\s+name|registered\s+name",
+    ),
+    (
+        "address",
+        "Address",
+        r"business\s+address|registered\s+address|"
+        r"address\s+of\s+(?:the\s+)?(?:business|establishment)|address",
+    ),
+    (
+        "tin",
+        "TIN",
+        r"taxpayer(?:'s)?\s+identification\s+number|tin\s*(?:no\.?|number)?",
+    ),
+    (
+        "effective",
+        "Effective",
+        r"effective\s+(?:date|on)|date\s+of\s+effectivity|"
+        r"effectivity(?:\s+date)?|valid\s+(?:from|beginning|start)",
+    ),
+)
+
+# The printed permit reads as a sentence - "Permit hereby granted to <name>,
+# with business name <business>, address of <address>, ... effective <date>" -
+# so between a label and its value sit these connective words. They are peeled
+# off the front of a value, longest phrase first.
+PTU_VALUE_FILLER = {
+    "proprietor": (
+        r"permit\s+is\s+hereby\s+granted\s+to",
+        r"permit\s+hereby\s+granted\s+to",
+        r"permit\s+is\s+granted\s+to",
+        r"permit\s+granted\s+to",
+        r"is\s+hereby\s+granted\s+to",
+        r"hereby\s+granted\s+to",
+        r"granted\s+unto",
+        r"granted\s+to",
+        r"granted",
+    ),
+    "business_name": (
+        r"with\s+the\s+business\s+name",
+        r"with\s+business\s+name",
+        r"under\s+the\s+business\s+name",
+        r"under\s+business\s+name",
+        r"with\s+the\s+trade\s+name",
+        r"with\s+trade\s+name",
+        r"business\s+name",
+        r"trade\s+name",
+    ),
+    "address": (
+        r"with\s+address\s+of",
+        r"with\s+business\s+address",
+        r"business\s+address",
+        r"registered\s+address",
+        r"address\s+of",
+        r"located\s+at",
+        r"of",
+        r"at",
+    ),
+    "tin": (
+        r"taxpayer(?:'s)?\s+identification\s+number",
+        r"tin\s+no\.?",
+        r"tin\s+number",
+    ),
+    "effective": (
+        r"date\s+of\s+effectivity",
+        r"effective\s+date",
+        r"effective\s+on",
+        r"effectivity(?:\s+date)?",
+        r"valid\s+from",
+        r"effective",
+        r"date",
+        r"on",
+    ),
+}
+
+_PTU_MONTHS = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+# 3-3-3 and 3-3-3-5 (branch) as printed; OCR may swap the dashes for spaces.
+_PTU_TIN_RE = re.compile(r"\b(\d{3})[-\u2013\u2014\s.]?(\d{3})[-\u2013\u2014\s.]?(\d{3})(?:[-\u2013\u2014\s.]?(\d{3,5}))?\b")
+_PTU_DATE_RE = re.compile(
+    r"(?i)\b(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}"
+    r"|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?,?\s+\d{4}"
+    r"|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b"
+)
+
+
+def _ptu_cut_at_other_label(text, key):
+    """Text up to the next label of a *different* field.
+
+    The same field's label is skipped on purpose: prose such as "permit hereby
+    granted to" is also the proprietor label, and cutting there would leave an
+    empty value.
+    """
+    cut = len(text)
+    for other_key, _label, pattern in PTU_FIELD_SPECS:
+        if other_key == key:
+            continue
+        match = re.search(r"(?i)\b(?:" + pattern + r")\b", text)
+        if match and match.start() < cut:
+            cut = match.start()
+    return text[:cut]
+
+
+def _ptu_strip_filler(key, text):
+    """Drop the connectives the printed sentence puts between label and value.
+
+    "Business Name: With business name JJ-..." leaves "JJ-..."; "Address : of
+    1354 ..." leaves "1354 ...". Longest phrase first, so "with business name"
+    wins over "business name".
+    """
+    text = text.lstrip(" \t\r\n:;,.|_\u2013\u2014-")
+    for _ in range(6):
+        for phrase in PTU_VALUE_FILLER.get(key, ()):
+            # The hyphen is last in the class on purpose: anywhere else it
+            # would make a range and eat the whole value.
+            match = re.match(r"(?i)" + phrase + r"\b[\s:;,.|_\u2013\u2014-]*", text)
+            if match and match.end() > 0:
+                text = text[match.end():]
+                break
+        else:
+            break
+    return text.strip()
+
+
+def _ptu_month_name(word):
+    """The month a token stands for, tolerating one misread letter: "Apnl"."""
+    token = re.sub(r"[^a-z]", "", word.lower())
+    if len(token) < 3:
+        return ""
+    for name in _PTU_MONTHS:
+        if token in (name.lower(), name[:3].lower()):
+            return name
+    # Only months that start with the same letter are candidates, so a name
+    # like "Janna" can never be read as July.
+    candidates = [name for name in _PTU_MONTHS if name[0].lower() == token[0]]
+    if not candidates:
+        return ""
+    best = max(
+        candidates,
+        key=lambda name: difflib.SequenceMatcher(None, token, name.lower()).ratio(),
+    )
+    if difflib.SequenceMatcher(None, token, best.lower()).ratio() >= 0.6:
+        return best
+    return ""
+
+
+def _ptu_find_date(value):
+    """The date in a value, repaired when OCR misread the month.
+
+    "Apnl 27. 2026" comes back as "April 27, 2026": the month name is the one
+    Windows knows, while day and year are the numbers OCR actually read.
+    """
+    strict = _PTU_DATE_RE.search(value)
+    if strict:
+        return strict.group(0).strip(" ,.")
+
+    words = re.findall(r"[A-Za-z]+|\d{1,4}", value)
+    numbers = [int(word) for word in words if word.isdigit()]
+    years = [number for number in numbers if 1900 <= number <= 2099]
+    days = [number for number in numbers if 1 <= number <= 31 and number not in years]
+    for word in words:
+        if not word.isalpha():
+            continue
+        month = _ptu_month_name(word)
+        if not month:
+            continue
+        if years and days:
+            return f"{month} {days[0]}, {years[0]}"
+        if years:
+            return f"{month} {years[0]}"
+
+    stripped = value.strip(" ,.")
+    return stripped if any(char.isdigit() for char in stripped) else ""
+
+
+def _ptu_finalize(key, value):
+    """One line, no wrapping punctuation; names stop at their first comma."""
+    value = re.sub(r"\s+", " ", value).strip(" \t:;,-\u2013\u2014.|_")
+    if key in ("proprietor", "business_name"):
+        value = re.split(r"\s*[,;]\s*", value)[0].strip(" \t:;,-\u2013\u2014.|_")
+    return value
+
+
+def _ptu_format_tin(match):
+    """A TIN the way it is printed: 682-090-387-00001."""
+    return "-".join(group for group in match.groups() if group)
+
+
+def _ptu_extract_fields(text):
+    """Proprietor, business name, address, TIN and effective date from OCR text.
+
+    Worked out on the whole text, not line by line: on a skewed scan a label and
+    its value rarely share a line, and the printed permit states each value as a
+    sentence that repeats the label ("Business Name: With business name ...").
+    For each field, the first label whose remainder yields a plausible value
+    wins; nothing is inferred from position alone.
+    """
+    flat = re.sub(r"\s+", " ", text or "").strip()
+    values = {key: "" for key, _label, _pattern in PTU_FIELD_SPECS}
+    if not flat:
+        return values
+
+    for key, _label, pattern in PTU_FIELD_SPECS:
+        label_re = re.compile(r"(?i)\b(?:" + pattern + r")\b")
+        for match in label_re.finditer(flat):
+            value = _ptu_cut_at_other_label(flat[match.end():], key)
+            value = _ptu_strip_filler(key, value)
+            if key == "tin":
+                found = _PTU_TIN_RE.search(value) or _PTU_TIN_RE.search(flat)
+                if not found:
+                    continue
+                value = _ptu_format_tin(found)
+            elif key == "effective":
+                value = _ptu_find_date(value)
+                if not value:
+                    continue
+            else:
+                value = _ptu_finalize(key, value)
+                if not value:
+                    continue
+            values[key] = value
+            break
+
+    # A TIN is the one field with a shape of its own: if its label was lost to
+    # OCR, the number itself is still findable.
+    if not values["tin"]:
+        found = _PTU_TIN_RE.search(flat)
+        if found:
+            values["tin"] = _ptu_format_tin(found)
+
+    return values
+
+
+def _ptu_prepare_image(image):
+    """A PIL image as PNG bytes, sized for the OCR engine.
+
+    Small screenshots are doubled: the engine reads 6-8 pt table text far more
+    reliably at twice the pixels, and a photo of a permit is rarely large
+    enough to lose detail that way. Very large pictures are scaled down to the
+    engine's comfortable range instead.
+    """
+    prepared = image.convert("RGB")
+    width, height = prepared.size
+    longest = max(width, height)
+    if not longest:
+        factor = 1.0
+    elif longest <= PTU_OCR_UPSCALE_BELOW:
+        factor = 2.0
+    elif longest > PTU_OCR_MAX_SIDE:
+        factor = PTU_OCR_MAX_SIDE / longest
+    else:
+        factor = 1.0
+    if factor != 1.0:
+        prepared = prepared.resize(
+            (max(1, round(width * factor)), max(1, round(height * factor))),
+            Image.Resampling.LANCZOS,
+        )
+    buffer = BytesIO()
+    prepared.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+async def _ptu_ocr_async(png_bytes):
+    """Run Windows OCR over one PNG and return its lines joined by newlines."""
+    stream = InMemoryRandomAccessStream()
+    writer = DataWriter(stream)
+    writer.write_bytes(png_bytes)
+    await writer.store_async()
+    writer.detach_stream()
+    stream.seek(0)
+
+    decoder = await BitmapDecoder.create_async(stream)
+    bitmap = await decoder.get_software_bitmap_async()
+
+    # The user's own languages first (so a Filipino/English PC OCRs the same
+    # way its Photos app does), then any recogniser the PC has installed.
+    engine = OcrEngine.try_create_from_user_profile_languages()
+    if engine is None:
+        for language in OcrEngine.available_recognizer_languages:
+            engine = OcrEngine.try_create_from_language(language)
+            if engine is not None:
+                break
+    if engine is None:
+        raise RuntimeError(
+            "Windows OCR has no language installed. Add one under Settings > "
+            "Time & language > Language & region."
+        )
+
+    result = await engine.recognize_async(bitmap)
+    return "\n".join(line.text for line in result.lines)
+
+
+def _ptu_ocr_png(png_bytes):
+    """Windows OCR on one PNG. Blocking: call it from the worker thread."""
+    if OcrEngine is None:
+        raise RuntimeError(
+            "OCR is not available in the Python running this app. Install the "
+            "packages with `pip install -r requirements.txt` (then run "
+            f"build.bat if you use the exe). Reason: {_OCR_IMPORT_ERROR or 'unknown'}"
+        )
+    return asyncio.run(_ptu_ocr_async(png_bytes))
+
+
+def _ptu_read_image(path):
+    """Text of one picture, plus a note saying which engine read it."""
+    with Image.open(path) as image:
+        png = _ptu_prepare_image(image)
+    text = _ptu_ocr_png(png).strip()
+    return text, "Read with Windows OCR (offline)."
+
+
+def _ptu_read_pdf(path):
+    """Text of a PDF, mixing its text layer and OCR page by page.
+
+    A page with a real text layer is used as-is: that is exact. A page with
+    almost no text is treated as a scan, rendered to pixels and OCR'd, which is
+    what makes a printed-then-scanned permit readable at all.
+    """
+    if PdfReader is None:
+        raise RuntimeError(
+            "Reading PDFs is not available in the Python running this app. "
+            "Install pypdf with `pip install -r requirements.txt` "
+            f"(then run build.bat if you use the exe). Reason: {_PDF_IMPORT_ERROR}"
+        )
+
+    reader = PdfReader(path)
+    if getattr(reader, "is_encrypted", False):
+        try:
+            reader.decrypt("")
+        except Exception:
+            raise RuntimeError("That PDF is password protected.")
+
+    document = None
+    pages = []
+    from_text = 0
+    from_ocr = 0
+    skipped = 0
+
+    for index, page in enumerate(reader.pages):
+        try:
+            text = (page.extract_text() or "").strip()
+        except Exception:
+            logger.exception("Could not extract page %d of %s", index + 1, path)
+            text = ""
+
+        if len(text) >= PTU_MIN_TEXT_CHARS:
+            pages.append((index + 1, text))
+            from_text += 1
+            continue
+
+        if pdfium is None:
+            skipped += 1
+            pages.append((index + 1, text))
+            continue
+
+        try:
+            if document is None:
+                document = pdfium.PdfDocument(path)
+            bitmap = document[index].render(scale=PTU_PDF_RENDER_SCALE)
+            image = bitmap.to_pil()
+            try:
+                text = _ptu_ocr_png(_ptu_prepare_image(image)).strip()
+            finally:
+                image.close()
+            pages.append((index + 1, text))
+            from_ocr += 1
+        except Exception as e:
+            logger.exception("Could not read page %d of %s as a scan", index + 1, path)
+            pages.append((index + 1, f"(this page could not be read: {e})"))
+            skipped += 1
+
+    notes = []
+    if from_text:
+        notes.append(f"{from_text} page(s) read from the PDF's text layer.")
+    if from_ocr:
+        notes.append(f"{from_ocr} scanned page(s) read with Windows OCR.")
+    if skipped and pdfium is None:
+        notes.append(
+            f"{skipped} page(s) have no text layer and could not be read "
+            f"because pypdfium2 is missing ({_PDFIUM_IMPORT_ERROR})."
+        )
+
+    if len(pages) > 1:
+        body = "\n\n".join(
+            f"--- Page {number} ---\n{text}" for number, text in pages
+        )
+    elif pages:
+        body = pages[0][1]
+    else:
+        body = ""
+    return body, " ".join(notes) or "The PDF has no readable pages."
+
+
+def _ptu_read_file(path):
+    """(text, note) for one PDF or picture. Raises RuntimeError with a reason."""
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix not in PTU_SUFFIXES:
+        raise RuntimeError("Use a PDF or a picture (PNG, JPG, BMP, TIFF, WEBP).")
+    if not os.path.exists(path):
+        raise RuntimeError("That file is no longer there.")
+    if suffix == ".pdf":
+        return _ptu_read_pdf(path)
+    return _ptu_read_image(path)
+
+
+# ================= GEMINI (OPTIONAL) =================
+# Local OCR reads characters; a vision model reads the page. This permit is a
+# skewed, sentence-shaped form, so the model is clearly better at the five
+# header fields - at the cost of the image leaving this PC. That trade is the
+# user's to make: the tool is only opened once a key exists, and the tier text
+# in PtuApiKeyDialog says where the image goes.
+#
+# REST only, through `requests` (already a dependency): no google-genai SDK to
+# freeze into the build, and no extra wheels.
+#
+# Google retires model ids (gemini-2.5-flash now answers 404), so the default is
+# the current stable Flash and a 404 walks the fallback list instead of failing
+# the read. Reported as "Fields read by Gemini (<model>)" so the log says which
+# one answered.
+PTU_GEMINI_MODEL = (
+    os.environ.get("AUTOREPORT_GEMINI_MODEL", "").strip() or "gemini-3.8-flash"
+)
+PTU_GEMINI_FALLBACK_MODELS = ("gemini-3.7-flash", "gemini-2.5-flash")
+# 503 ("high demand") is routine on a new Flash model, and a short wait usually
+# turns it into a success. 429 is retried the same way: it is normally a
+# per-minute limit rather than an exhausted quota, and the status line still
+# explains it if the last attempt fails.
+PTU_AI_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+PTU_AI_RETRY_WAIT = 3           # seconds; attempt n waits n * this
+PTU_AI_ATTEMPTS = (3, 2)        # per model, in order; the default gets one more
+# Asking the API which models exist beats hard-coding ids Google retires, and
+# leaves room to fail over when the newest Flash is the one that is busy.
+PTU_GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+PTU_AI_MODEL_WORDS = ("tts", "live", "image", "embedding", "audio")
+PTU_AI_MODELS = []              # filled by the first read, reused after that
+PTU_AI_KEY_URL = "https://aistudio.google.com/apikey"
+PTU_GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
+PTU_AI_MAX_SIDE = 2400      # a 2400 px page keeps table text legible
+PTU_AI_MAX_PAGES = 3        # a permit is one or two pages in practice
+PTU_AI_PROMPT = (
+    "This is a Philippine BIR permit to use sales machine. Read the page and "
+    "return JSON only, with exactly these keys and no others:\n"
+    '{"proprietor": "", "business_name": "", "address": "", "tin": "", '
+    '"effective": ""}\n'
+    "proprietor: the name the permit is granted to (after GRANTED TO or "
+    "PROPRIETOR).\n"
+    "business_name: the business or trade name.\n"
+    "address: the full registered address, exactly as printed.\n"
+    "tin: the taxpayer identification number, formatted 000-000-000-00000.\n"
+    "effective: the effective date, formatted Month DD, YYYY.\n"
+    "Do not repeat the label, do not explain, do not add keys. Use an empty "
+    "string for any value that is not printed on the page."
+)
+
+
+def _ai_key_file():
+    return os.path.join(_credential_dir(), "gemini_api_key.bin")
+
+
+def _save_ai_key(key):
+    """Store the Gemini key for this Windows user, like the TFS PAT."""
+    if not key:
+        return False
+    try:
+        with open(_ai_key_file(), "wb") as f:
+            f.write(_dpapi(key.encode("utf-8"), protect=True))
+        return True
+    except Exception:
+        logger.exception("Could not store the Gemini API key locally")
+        return False
+
+
+def _load_ai_key():
+    try:
+        path = _ai_key_file()
+        if not os.path.isfile(path):
+            return ""
+        with open(path, "rb") as f:
+            return _dpapi(f.read(), protect=False).decode("utf-8")
+    except Exception:
+        logger.exception("Could not read the stored Gemini API key")
+        return ""
+
+
+PTU_AI_KEY_FIELD = "gemini_api_key"
+
+
+def _load_ai_key_remote(user_data):
+    """This user's Gemini key from users/{uid}, or "" when there is none.
+
+    The key lives on the owner-only user document - the same place as the TFS
+    PAT - so it follows the account to any PC. Raises FirebaseError when the
+    document cannot be read, so the caller can tell "no key saved" apart from
+    "could not ask".
+    """
+    uid = (user_data or {}).get("uid", "")
+    if not uid:
+        return ""
+    token = user_data.get("id_token", "")
+    try:
+        profile = _load_profile(uid, token)
+    except FirebaseError:
+        # An hour-old token is the common cause; one refresh, then give up.
+        token = _refresh_id_token(user_data) or token
+        profile = _load_profile(uid, token)
+    return str(profile.get(PTU_AI_KEY_FIELD) or "").strip()
+
+
+def _save_ai_key_remote(user_data, key):
+    """Mirror the Gemini key into users/{uid}.
+
+    Best effort, like the PAT: offline or a rules refusal leaves the DPAPI copy
+    on this PC in charge, so the tool keeps working here.
+    """
+    uid = (user_data or {}).get("uid", "")
+    if not (uid and key):
+        return False
+    try:
+        _update_user_profile(user_data, {PTU_AI_KEY_FIELD: key})
+        logger.info("Gemini API key synced to Firestore for uid=%s", uid)
+        return True
+    except Exception as e:
+        logger.warning("Could not sync the Gemini key to Firestore: %s", e)
+        return False
+
+
+def _delete_ai_key():
+    """Remove the DPAPI copy from this PC. True when one was actually deleted."""
+    path = _ai_key_file()
+    if not os.path.isfile(path):
+        return False
+    try:
+        os.remove(path)
+        logger.info("Gemini API key removed from this PC")
+        return True
+    except Exception:
+        logger.exception("Could not remove the Gemini API key from this PC")
+        return False
+
+
+def _delete_ai_key_remote(user_data):
+    """Drop gemini_api_key from users/{uid}: the field goes, the doc stays."""
+    uid = (user_data or {}).get("uid", "")
+    if not uid:
+        return False
+    try:
+        # None on the field path is how the masked update deletes a field.
+        _update_user_profile(user_data, {PTU_AI_KEY_FIELD: None})
+        logger.info("Gemini API key removed from Firestore for uid=%s", uid)
+        return True
+    except Exception as e:
+        logger.warning("Could not remove the Gemini key from Firestore: %s", e)
+        return False
+
+
+def _ptu_ai_image_bytes(image):
+    """One page as JPEG for the model."""
+    prepared = image.convert("RGB")
+    width, height = prepared.size
+    longest = max(width, height)
+    if longest > PTU_AI_MAX_SIDE:
+        scale = PTU_AI_MAX_SIDE / longest
+        prepared = prepared.resize(
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    # JPEG on purpose: a 2400 px page is about 1 MB instead of 6 MB, and the
+    # model gains nothing from the extra bytes.
+    buffer = BytesIO()
+    prepared.save(buffer, format="JPEG", quality=90, optimize=True)
+    return buffer.getvalue()
+
+
+def _ptu_ai_images(path):
+    """The pages of the file as JPEG bytes, for sending to the model."""
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix != ".pdf":
+        with Image.open(path) as image:
+            return [_ptu_ai_image_bytes(image)]
+    if pdfium is None:
+        raise RuntimeError(
+            "Sending a PDF to Gemini needs pypdfium2 to render its pages. "
+            "Run: pip install -r requirements.txt"
+        )
+    document = pdfium.PdfDocument(path)
+    images = []
+    for index in range(min(len(document), PTU_AI_MAX_PAGES)):
+        bitmap = document[index].render(scale=PTU_PDF_RENDER_SCALE)
+        image = bitmap.to_pil()
+        try:
+            images.append(_ptu_ai_image_bytes(image))
+        finally:
+            image.close()
+    return images
+
+
+def _ptu_ai_parse_json(answer):
+    """The JSON object in the model's answer, tolerating a stray code fence."""
+    text = answer.strip()
+    text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except ValueError:
+                pass
+    raise RuntimeError("Gemini's answer was not the JSON that was asked for.")
+
+
+def _ptu_ai_error(response):
+    """A readable reason for a failed Gemini call (the body is a JSON error)."""
+    status = response.status_code
+    if status in (401, 403):
+        return "The Gemini API key was rejected. Check it in Google AI Studio."
+    if status == 429:
+        return "Gemini's rate limit or quota was reached. Try again in a minute."
+    if status == 503:
+        return (
+            "Gemini is busy right now (503, high demand) and every retry met "
+            "the same answer. The permit is fine - try the same file again in a "
+            "minute."
+        )
+    if status in (500, 502, 504):
+        return (
+            f"Gemini had a server error ({status}) and the retries did not "
+            "clear it. Try the same file again in a minute."
+        )
+    snippet = re.sub(r"\s+", " ", response.text or "")[:300].strip()
+    return f"Gemini returned {status}. {snippet}".strip()
+
+
+def _ptu_ai_post(model, api_key, payload):
+    """One generateContent call for one model id."""
+    try:
+        return requests.post(
+            PTU_GEMINI_URL.format(model=model),
+            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            json=payload,
+            timeout=(15, 120),
+        )
+    except requests.RequestException as e:
+        # No URL or key in the message: the status line is visible, the log is
+        # not always.
+        raise RuntimeError(
+            f"Could not reach Gemini ({e.__class__.__name__}). Check the "
+            "internet connection."
+        )
+
+
+def _ptu_ai_discovered_models(api_key):
+    """Flash text models this key can call, as reported by the API itself.
+
+    Discovered once per launch: the list changes only when Google ships or
+    retires a model, and a permit read should not pay for a listing every time.
+    """
+    if PTU_AI_MODELS:
+        return list(PTU_AI_MODELS)
+    body = {}
+    try:
+        resp = requests.get(
+            PTU_GEMINI_MODELS_URL,
+            headers={"x-goog-api-key": api_key},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            body = resp.json() or {}
+        else:
+            logger.warning("Listing Gemini models answered %d", resp.status_code)
+    except Exception:
+        logger.exception("Could not list the Gemini models")
+    found = []
+    for item in body.get("models", []) or []:
+        name = str(item.get("name", "")).removeprefix("models/")
+        methods = [str(m).lower() for m in item.get("supportedGenerationMethods") or []]
+        lowered = name.lower()
+        if not name or "generatecontent" not in methods:
+            continue
+        if "flash" not in lowered or any(w in lowered for w in PTU_AI_MODEL_WORDS):
+            continue
+        found.append(name)
+    PTU_AI_MODELS.extend(found[:4])
+    return list(PTU_AI_MODELS)
+
+
+def _ptu_ai_post_retrying(model, api_key, payload, attempts):
+    """POST once, waiting out the statuses that mean "busy", not "wrong".
+
+    A 5xx or a 429 says nothing about the page, so the request is repeated a
+    couple of times before the model is treated as unavailable. Sleeping here is
+    fine: this runs in PtuExtractionWorker, not on the GUI thread.
+    """
+    response = None
+    for attempt in range(max(1, attempts)):
+        response = _ptu_ai_post(model, api_key, payload)
+        if response.status_code not in PTU_AI_RETRY_STATUSES:
+            return response
+        if attempt + 1 < attempts:
+            wait = PTU_AI_RETRY_WAIT * (attempt + 1)
+            logger.warning(
+                "Gemini %s answered %d; retrying in %ss",
+                model, response.status_code, wait,
+            )
+            time.sleep(wait)
+    return response
+
+
+def _ptu_ai_read(path, api_key):
+    """(values, model) read by Gemini from the page image itself.
+
+    Two kinds of failure are worked around instead of reported: a 404 (the model
+    id was retired or is not on this key's plan) moves to the next candidate, and
+    a 5xx/429 is retried on the same one first, because those are demand spikes
+    rather than anything wrong with the page or the key.
+    """
+    images = _ptu_ai_images(path)
+    if not images:
+        raise RuntimeError("No page could be prepared to send.")
+    parts = [{"text": PTU_AI_PROMPT}]
+    for data in images:
+        parts.append({
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": base64.b64encode(data).decode("ascii"),
+            }
+        })
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        # No temperature: the Gemini 3 family ignores or rejects the older
+        # sampling knobs, and the prompt already pins the output shape.
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+    models = [PTU_GEMINI_MODEL]
+    models += _ptu_ai_discovered_models(api_key)
+    models += list(PTU_GEMINI_FALLBACK_MODELS)
+    models = list(dict.fromkeys(models))[:5]
+    response = None
+    model = models[0]
+    for index, candidate in enumerate(models):
+        attempts = PTU_AI_ATTEMPTS[min(index, len(PTU_AI_ATTEMPTS) - 1)]
+        response = _ptu_ai_post_retrying(candidate, api_key, payload, attempts)
+        if response.status_code == 200:
+            model = candidate
+            break
+        if response.status_code in PTU_AI_RETRY_STATUSES:
+            # Busy is about the model, not the page: the next one may have
+            # capacity, and 3.8 Flash is the newest, so it is the busiest.
+            logger.warning(
+                "Gemini model %s is busy (%d); trying the next one",
+                candidate, response.status_code,
+            )
+            continue
+        if response.status_code == 404:
+            logger.warning(
+                "Gemini model %s is not available for this key; trying the next",
+                candidate,
+            )
+            continue
+        # A rejected key or a bad request fails the same way on every model.
+        model = candidate
+        break
+    else:
+        if response is not None and response.status_code in PTU_AI_RETRY_STATUSES:
+            raise RuntimeError(_ptu_ai_error(response))
+        raise RuntimeError(
+            "None of these Gemini models is available for this key: "
+            f"{', '.join(models)}. Check the key's project in Google AI Studio, "
+            "or set AUTOREPORT_GEMINI_MODEL to a model the project can use."
+        )
+    if response.status_code != 200:
+        raise RuntimeError(_ptu_ai_error(response))
+
+    try:
+        body = response.json()
+    except ValueError:
+        raise RuntimeError("Gemini's response was not JSON.")
+    block = (body.get("promptFeedback") or {}).get("blockReason")
+    if block:
+        raise RuntimeError(f"Gemini would not read the page ({block}).")
+    candidates = body.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("Gemini returned no result for the page.")
+    response_parts = (candidates[0].get("content") or {}).get("parts", [])
+    # Gemini 3 can return its reasoning as extra parts. The JSON is in the parts
+    # that are not marked as thoughts, and a thought containing a brace would
+    # confuse the brace-slice fallback in _ptu_ai_parse_json.
+    answer = "".join(
+        part.get("text", "") for part in response_parts if not part.get("thought")
+    ).strip() or "".join(part.get("text", "") for part in response_parts).strip()
+    if not answer:
+        finish = candidates[0].get("finishReason") or "unknown"
+        raise RuntimeError(f"Gemini returned no text ({finish}).")
+
+    parsed = _ptu_ai_parse_json(answer)
+    values = {}
+    for key, _label, _pattern in PTU_FIELD_SPECS:
+        raw = parsed.get(key)
+        values[key] = _ptu_finalize(key, raw) if isinstance(raw, str) else ""
+    tin = _PTU_TIN_RE.search(values["tin"])
+    values["tin"] = _ptu_format_tin(tin) if tin else values["tin"]
+    if values["effective"]:
+        values["effective"] = (
+            _ptu_find_date(values["effective"]) or values["effective"]
+        )
+    return values, model
+
+
+class PtuExtractionWorker(QThread):
+    """Reads one PTU file off the GUI thread: OCR and the AI call are slow."""
+
+    done = pyqtSignal(str, str, object)     # text, note, AI fields (or None)
+    failed = pyqtSignal(str)
+
+    def __init__(self, path, parent=None, api_key=""):
+        super().__init__(parent)
+        self.path = path
+        self.api_key = api_key or ""
+
+    def run(self):
+        text, note = "", ""
+        try:
+            text, note = _ptu_read_file(self.path)
+        except Exception as e:
+            logger.exception("Could not read the PTU file %s", self.path)
+            # With a key the model can still read the page, and its answer is
+            # the better of the two - so a local failure is only fatal offline.
+            if not self.api_key:
+                self.failed.emit(str(e))
+                return
+            note = f"Local reading failed ({e})."
+
+        fields = None
+        if self.api_key:
+            try:
+                fields, model = _ptu_ai_read(self.path, self.api_key)
+                note = f"{note} Fields read by Gemini ({model}).".strip()
+            except Exception as e:
+                logger.exception("Gemini could not read the PTU file %s", self.path)
+                note = f"{note} AI read failed: {e}".strip()
+        self.done.emit(text, note, fields)
+
+
+class PtuApiKeyDialog(QDialog):
+    """The gate in front of the PTU tool: a Gemini key, or no tool.
+
+    The tool reads permits with Gemini, so it is useless without a key. This
+    asks for one, points at the page that creates it, and stores it both on this
+    PC (DPAPI, like the TFS token) and on the signed-in user's Firestore
+    document - so it is asked once per account, not once per machine.
+    """
+
+    def __init__(self, parent=None, user_data=None, note=""):
+        super().__init__(parent)
+        self.setWindowIcon(QtGui.QIcon(os.path.join(ASSET_DIR, "death.ico")))
+        self.setWindowTitle("PTU Generator - Gemini API key needed")
+        self.setObjectName("Root")
+        self.setMinimumWidth(580)
+        self.saved_key = ""
+        self.user_data = user_data or {}
+
+        if is_windows_dark_mode():
+            self.setStyleSheet("""
+            QDialog#Root {
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 #07101a, stop:1 #07121a);
+                font-family: Inter, Segoe UI, Arial;
+                color: #e6eef5;
+            }
+            QLabel { color: #e6eef5; background: transparent; }
+            QLabel#noteLabel { color: #f6c177; }
+            QLineEdit {
+                background: rgba(255,255,255,0.06);
+                border: 1px solid rgba(255,255,255,0.14);
+                border-radius: 8px;
+                padding: 8px 10px;
+                color: #e6eef5;
+                selection-background-color: #ed3b3b;
+            }
+            QPushButton {
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 #ed3b3b, stop:1 #c62e2e);
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 8px 16px;
+            }
+            QPushButton:disabled { background: rgba(255,255,255,0.12); color: #9fb0be; }
+            QPushButton#ghost {
+                background: transparent;
+                border: 1px solid rgba(255,255,255,0.18);
+                color: #e6eef5;
+            }
+            QPushButton#ghost:hover { background: rgba(255,255,255,0.06); }
+            """)
+        else:
+            self.setStyleSheet("""
+            QDialog#Root {
+                background: #f5f7fa;
+                font-family: Inter, Segoe UI, Arial;
+                color: #1f2933;
+            }
+            QLabel { color: #111827; background: transparent; }
+            QLabel#noteLabel { color: #92400e; }
+            QLineEdit {
+                background: #ffffff;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 8px 10px;
+                color: #111827;
+                selection-background-color: #ed3b3b;
+            }
+            QPushButton {
+                background: #ed3b3b;
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 8px 16px;
+            }
+            QPushButton:hover { background: #c62e2e; }
+            QPushButton:disabled { background: #e5e7eb; color: #9ca3af; }
+            QPushButton#ghost {
+                background: #ffffff;
+                border: 1px solid #d1d5db;
+                color: #111827;
+            }
+            QPushButton#ghost:hover { background: #eef1f5; }
+            """)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(12)
+
+        title = QtWidgets.QLabel("This tool needs a Gemini API key")
+        title.setStyleSheet("font-size: 16px; font-weight: 700;")
+        layout.addWidget(title)
+
+        if note:
+            note_label = QtWidgets.QLabel(note)
+            note_label.setWordWrap(True)
+            note_label.setObjectName("noteLabel")
+            layout.addWidget(note_label)
+
+        where = (
+            "It goes into your account as well as this PC, so the tool opens "
+            "straight away on any PC you sign in to."
+            if self.user_data
+            else "It is kept encrypted on this PC."
+        )
+        body = QtWidgets.QLabel(
+            "PTU Generator reads the permit with Google Gemini, so it does not "
+            "open until there is a key. Create one in Google AI Studio (the "
+            "free tier is enough) and paste it below. " + where
+        )
+        body.setWordWrap(True)
+        layout.addWidget(body)
+
+        link = QtWidgets.QLabel(f'<a href="{PTU_AI_KEY_URL}">{PTU_AI_KEY_URL}</a>')
+        link.setOpenExternalLinks(True)
+        link.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        layout.addWidget(link)
+
+        self.key_edit = QtWidgets.QLineEdit()
+        self.key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.key_edit.setPlaceholderText("Paste the key from Google AI Studio")
+        self.key_edit.returnPressed.connect(self._save)
+        layout.addWidget(self.key_edit)
+
+        self.status_label = QtWidgets.QLabel(
+            "The permit image is sent to Google only while the fields are read."
+        )
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        buttons = QtWidgets.QHBoxLayout()
+        open_btn = QPushButton("Open Google AI Studio")
+        open_btn.setObjectName("ghost")
+        open_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(PTU_AI_KEY_URL))
+        )
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("ghost")
+        cancel_btn.clicked.connect(self.reject)
+        self.save_btn = QPushButton("Save key")
+        self.save_btn.clicked.connect(self._save)
+        buttons.addWidget(open_btn)
+        buttons.addStretch()
+        buttons.addWidget(cancel_btn)
+        buttons.addWidget(self.save_btn)
+        layout.addLayout(buttons)
+
+    def _save(self):
+        key = self.key_edit.text().strip()
+        if not key:
+            self.status_label.setText(
+                "Paste the key first, or open Google AI Studio to create one."
+            )
+            self.key_edit.setFocus()
+            return
+        saved_here = _save_ai_key(key)
+        saved_remote = _save_ai_key_remote(self.user_data, key)
+        if not (saved_here or saved_remote):
+            self.status_label.setText(
+                "The key could not be saved on this PC - see the log for why."
+            )
+            return
+        if saved_here and self.user_data and not saved_remote:
+            # Still usable here; the account copy is what carries it to another
+            # PC. _save_ai_key_remote already logged the reason.
+            logger.warning("Gemini key saved on this PC only, not to the account")
+        self.saved_key = key
+        self.accept()
+
+
+class PtuGeneratorDialog(QDialog):
+    """Read a PTU permit from a PDF or an image and show what it contains.
+
+    Gemini reads the page image and returns the five header fields; Windows OCR
+    runs alongside it to show the text found on this PC and to fill any field
+    the model left empty.
+    """
+
+    def __init__(self, parent=None, api_key="", user_data=None):
+        super().__init__(parent)
+        self._worker = None
+        self.user_data = user_data or {}
+        # The key already accepted for this session; a successful read remembers
+        # it on the PC and on the account, but not twice for the same key.
+        self._synced_key = ""
+        self.setWindowTitle("PTU Generator")
+        self.setObjectName("PtuGenerator")
+        self.setMinimumSize(900, 760)
+        self.setStyleSheet(self._style())
+        self.setAcceptDrops(True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(12)
+
+        title = QtWidgets.QLabel("PTU Generator")
+        title.setStyleSheet("font-size: 20px; font-weight: 700;")
+        layout.addWidget(title)
+
+        subtitle = QtWidgets.QLabel(
+            "Drop a PTU permit (PDF or image) below, paste a screenshot with "
+            "Ctrl+V, or browse for the file. Gemini reads the page and the fields "
+            "it finds appear underneath, with the text read on this PC. The file "
+            "itself is never changed."
+        )
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        self.drop_zone = QtWidgets.QFrame()
+        self.drop_zone.setObjectName("dropZone")
+        self.drop_zone.setMinimumHeight(96)
+        self.drop_zone.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        drop_layout = QtWidgets.QVBoxLayout(self.drop_zone)
+        drop_layout.setContentsMargins(16, 14, 16, 14)
+        self.drop_label = QtWidgets.QLabel(
+            "Drop a PDF or an image here\n"
+            "or press Ctrl+V to paste, or click to browse"
+        )
+        self.drop_label.setObjectName("dropLabel")
+        self.drop_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        drop_layout.addWidget(self.drop_label)
+        self.drop_zone.mousePressEvent = lambda event: self._browse()
+        layout.addWidget(self.drop_zone)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.browse_btn = QPushButton("Browse...")
+        self.browse_btn.clicked.connect(self._browse)
+        self.paste_btn = QPushButton("Paste")
+        self.paste_btn.setObjectName("ghost")
+        self.paste_btn.clicked.connect(self._paste)
+        self.copy_btn = QPushButton("Copy text")
+        self.copy_btn.setObjectName("ghost")
+        self.copy_btn.clicked.connect(self._copy_text)
+        buttons.addWidget(self.browse_btn)
+        buttons.addWidget(self.paste_btn)
+        buttons.addStretch()
+        buttons.addWidget(self.copy_btn)
+        layout.addLayout(buttons)
+
+        # The permit is read by Gemini, so a key is what gets this tool opened at
+        # all. The row stays so the key can be replaced. It is stored the way
+        # the TFS PAT is - DPAPI, per Windows user - never bundled into the exe.
+        key_row = QtWidgets.QHBoxLayout()
+        key_row.setSpacing(10)
+        key_label = QtWidgets.QLabel("Gemini API key")
+        self.ai_key_edit = QtWidgets.QLineEdit()
+        self.ai_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.ai_key_edit.setText(api_key or _load_ai_key())
+        self.ai_key_edit.setPlaceholderText("Paste the key from Google AI Studio")
+        self.getkey_btn = QPushButton("Get a key")
+        self.getkey_btn.setObjectName("ghost")
+        self.getkey_btn.setToolTip(PTU_AI_KEY_URL)
+        self.getkey_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(PTU_AI_KEY_URL))
+        )
+        self.forget_btn = QPushButton("Forget key")
+        self.forget_btn.setObjectName("ghost")
+        self.forget_btn.setToolTip(
+            "Delete the saved key from this PC and from your account, then paste "
+            "a different one."
+        )
+        self.forget_btn.clicked.connect(self._forget_key)
+        key_row.addWidget(key_label)
+        key_row.addWidget(self.ai_key_edit, stretch=1)
+        key_row.addWidget(self.getkey_btn)
+        key_row.addWidget(self.forget_btn)
+        layout.addLayout(key_row)
+
+        # The five header fields, read-only: select a value to copy it, and a
+        # field the OCR could not pin down says "not found" instead of lying.
+        self.fields_frame = QtWidgets.QFrame()
+        self.fields_frame.setObjectName("fieldsBox")
+        fields_form = QtWidgets.QFormLayout(self.fields_frame)
+        fields_form.setContentsMargins(14, 12, 14, 12)
+        fields_form.setHorizontalSpacing(14)
+        fields_form.setVerticalSpacing(8)
+        fields_form.setLabelAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        self.field_edits = {}
+        for key, label, _pattern in PTU_FIELD_SPECS:
+            edit = QtWidgets.QLineEdit()
+            edit.setReadOnly(True)
+            edit.setPlaceholderText("not found")
+            self.field_edits[key] = edit
+            fields_form.addRow(label, edit)
+        layout.addWidget(self.fields_frame)
+
+        self.preview = QTextEdit()
+        self.preview.setObjectName("ptuPreview")
+        self.preview.setReadOnly(True)
+        self.preview.setAcceptDrops(False)
+        self.preview.setPlaceholderText(
+            "The text found in the permit appears here."
+        )
+        self.preview.setFont(QtGui.QFont("Consolas", 10))
+        layout.addWidget(self.preview, stretch=1)
+
+        self.busy_bar = QtWidgets.QProgressBar()
+        self.busy_bar.setObjectName("busyBar")
+        self.busy_bar.setRange(0, 0)
+        self.busy_bar.setTextVisible(False)
+        self.busy_bar.setFixedHeight(4)
+        self.busy_bar.setVisible(False)
+        layout.addWidget(self.busy_bar)
+
+        self.status_label = QtWidgets.QLabel(
+            "Supported files: PDF, PNG, JPG, BMP, TIFF, WEBP."
+        )
+        self.status_label.setObjectName("statusLabel")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        # Say what is missing before the user drops a file on it, with the real
+        # import error: a missing package and a broken install read differently.
+        if OcrEngine is None:
+            self.status_label.setText(
+                "Image and scan reading is off - the Windows OCR packages are "
+                f"not installed in this Python ({_OCR_IMPORT_ERROR}). Run: "
+                "pip install -r requirements.txt"
+            )
+        elif PdfReader is None or pdfium is None:
+            self.status_label.setText(
+                "Scanned PDF pages cannot be read - install the PDF packages "
+                "with: pip install -r requirements.txt"
+            )
+
+        close_row = QtWidgets.QHBoxLayout()
+        close_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("ghost")
+        close_btn.clicked.connect(self.reject)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+
+        # Ctrl+V works wherever the focus is, including the read-only preview.
+        paste_shortcut = QtGui.QShortcut(
+            QtGui.QKeySequence.StandardKey.Paste, self
+        )
+        paste_shortcut.setContext(QtCore.Qt.ShortcutContext.WindowShortcut)
+        paste_shortcut.activated.connect(self._paste)
+
+    # --- input ---
+
+    @staticmethod
+    def _path_from_mime(mime):
+        """The first dropped file this tool can read, or ""."""
+        if mime is None:
+            return ""
+        for url in mime.urls():
+            local = url.toLocalFile()
+            if local and os.path.splitext(local)[1].lower() in PTU_SUFFIXES:
+                return local
+        return ""
+
+    def dragEnterEvent(self, event):
+        if self._path_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        path = self._path_from_mime(event.mimeData())
+        if not path:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self._start(path)
+
+    def keyPressEvent(self, event):
+        if event.matches(QtGui.QKeySequence.StandardKey.Paste):
+            self._paste()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _browse(self):
+        if self._worker is not None and self._worker.isRunning():
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Open a PTU",
+            "",
+            "PTU files (*.pdf *.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp)",
+        )
+        if path:
+            self._start(path)
+
+    def _paste(self):
+        mime = QtWidgets.QApplication.clipboard().mimeData()
+        path = self._path_from_mime(mime)
+        if path:
+            self._start(path)
+            return
+        if mime is not None and mime.hasImage():
+            image = CommentEditor._clipboard_image(mime)
+            path = _write_temp_image(image)
+            if path:
+                self._start(path)
+                return
+            self._set_busy(False, "That picture could not be written to disk.")
+            return
+        self._set_busy(False, "The clipboard holds no picture or PDF file.")
+
+    # --- reading ---
+
+    def _ai_key(self):
+        """The key to send with, or "" - with a prompt when it is missing."""
+        key = self.ai_key_edit.text().strip()
+        if not key:
+            self.status_label.setText(
+                "Paste a Gemini API key on the row above before reading a file."
+            )
+        return key
+
+    def _start(self, path):
+        if self._worker is not None and self._worker.isRunning():
+            self.status_label.setText(
+                "Still reading the previous file - give it a second."
+            )
+            return
+        key = self._ai_key()
+        if not key:
+            return
+        self.preview.clear()
+        self._show_fields({})
+        self._set_busy(
+            True, f"Reading {os.path.basename(path)} with Gemini..."
+        )
+        # Keep it on this PC straight away (instant); the account copy waits for
+        # a read that proves the key works, so a typo never lands in Firestore.
+        self._remember_key(key)
+        self._worker = PtuExtractionWorker(path, self, api_key=key)
+        self._worker.done.connect(self._on_read)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+
+    def _forget_key(self):
+        """Delete the saved key here and on the account, then ask for another."""
+        if self._worker is not None and self._worker.isRunning():
+            self.status_label.setText(
+                "Wait for the current read to finish before removing the key."
+            )
+            return
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Remove the Gemini key",
+            "Delete the saved Gemini API key?\n\n"
+            "It is removed from this PC and from your account, and the tool "
+            "will ask for a key again before it can read a permit.",
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        removed_here = _delete_ai_key()
+        removed_remote = _delete_ai_key_remote(self.user_data)
+        self.ai_key_edit.clear()
+        self._synced_key = ""
+        if removed_here and removed_remote:
+            self.status_label.setText("Gemini key removed from this PC and your account.")
+        elif removed_here:
+            self.status_label.setText(
+                "Gemini key removed from this PC; your account could not be "
+                "updated, so it may still be there."
+            )
+        elif removed_remote:
+            self.status_label.setText("Gemini key removed from your account.")
+        else:
+            self.status_label.setText(
+                "No saved key was found - paste one above to use the tool."
+            )
+
+    def _remember_key(self, key, verified=False):
+        """Keep the key: on this PC always, on the account once it is proven.
+
+        verified=False is the instant local save; verified=True is the Firestore
+        write that a successful Gemini read earns, so a mistyped key is never
+        pushed to the account.
+        """
+        if not key:
+            return
+        _save_ai_key(key)
+        if verified and key != self._synced_key:
+            self._synced_key = key
+            _save_ai_key_remote(self.user_data, key)
+
+    def _on_read(self, text, note, ai_fields=None):
+        values = _ptu_extract_fields(text)
+        if ai_fields:
+            # The model's answer wins where it has one; anything it left empty
+            # keeps the local result rather than losing it.
+            for key, value in ai_fields.items():
+                if value:
+                    values[key] = value
+            self._remember_key(self.ai_key_edit.text().strip(), verified=True)
+        found = sum(1 for value in values.values() if value)
+        summary = f"{found}/5 fields found."
+        self._set_busy(False, f"{note} {summary}" if note else summary)
+        if text:
+            self.preview.setPlainText(text)
+        elif ai_fields:
+            self.preview.setPlainText(
+                "No local text was read from this file. The fields above were "
+                "read by Gemini."
+            )
+        else:
+            self.preview.setPlainText("No text could be read from this file.")
+        self._show_fields(values)
+
+    def _show_fields(self, values):
+        for key, _label, _pattern in PTU_FIELD_SPECS:
+            edit = self.field_edits.get(key)
+            if not edit or not _ui_alive(edit):
+                continue
+            edit.setText(values.get(key, ""))
+            edit.setCursorPosition(0)
+
+    def _on_failed(self, message):
+        self._set_busy(False, f"Could not read that file: {message}")
+
+    def _set_busy(self, busy, message=None):
+        if _ui_alive(self.busy_bar):
+            self.busy_bar.setVisible(busy)
+        for widget in (
+            self.browse_btn,
+            self.paste_btn,
+            self.drop_zone,
+            self.ai_key_edit,
+            self.getkey_btn,
+            self.forget_btn,
+        ):
+            if _ui_alive(widget):
+                widget.setEnabled(not busy)
+        if message is not None and _ui_alive(self.status_label):
+            self.status_label.setText(message)
+
+    def _copy_text(self):
+        text = self.preview.toPlainText()
+        if not text:
+            self.status_label.setText("Nothing to copy yet.")
+            return
+        QtWidgets.QApplication.clipboard().setText(text)
+        self.status_label.setText("Copied the readable text to the clipboard.")
+
+    # --- lifetime ---
+
+    def _reading(self):
+        return self._worker is not None and self._worker.isRunning()
+
+    def reject(self):
+        if self._reading():
+            self.status_label.setText("Still reading - give it a second.")
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self._reading():
+            event.ignore()
+            self.status_label.setText("Still reading - give it a second.")
+            return
+        super().closeEvent(event)
+
+    def _style(self):
+        if is_windows_dark_mode():
+            return """
+            QDialog#PtuGenerator {
+                background: #0f1923; color: #e6eef5;
+                font-family: Inter, Segoe UI, Arial;
+            }
+            QLabel { color: #e6eef5; }
+            QLabel#statusLabel { font-size: 12px; color: #98a0a6; }
+            QLabel#dropLabel { font-size: 13px; color: #c9d4de; }
+            QFrame#dropZone {
+                background: rgba(255,255,255,0.03);
+                border: 1px dashed rgba(255,255,255,0.22);
+                border-radius: 12px;
+            }
+            QFrame#dropZone:hover { border-color: #ed3b3b; }
+            QFrame#fieldsBox {
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 10px;
+            }
+            QLineEdit {
+                background: rgba(255,255,255,0.02);
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 6px; padding: 5px 8px;
+                color: #e6eef5; font-size: 13px;
+                selection-background-color: rgba(237,59,59,0.45);
+            }
+            QTextEdit {
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 10px; padding: 8px;
+                color: #e6eef5; font-size: 13px;
+                selection-background-color: rgba(237,59,59,0.45);
+            }
+            QPushButton {
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 #ed3b3b, stop:1 #c62e2e);
+                color: white; border-radius: 10px;
+                padding: 8px 16px; font-size: 13px; font-weight: 600;
+            }
+            QPushButton:hover { background: #c62e2e; }
+            QPushButton#ghost {
+                background: transparent;
+                border: 1px solid rgba(255,255,255,0.16);
+                color: #e6eef5; padding: 7px 14px;
+            }
+            QPushButton#ghost:hover { border-color: #ed3b3b; color: #ffffff; }
+            QPushButton:disabled { background: rgba(255,255,255,0.08); color: #98a0a6; }
+            QProgressBar {
+                background: rgba(255,255,255,0.08); border: none;
+                border-radius: 2px;
+            }
+            QProgressBar::chunk { background: #ed3b3b; border-radius: 2px; }
+            """
+        return """
+        QDialog#PtuGenerator {
+            background: #f5f7fa; color: #1f2933;
+            font-family: Inter, Segoe UI, Arial;
+        }
+        QLabel { color: #111827; }
+        QLabel#statusLabel { font-size: 12px; color: #6b7280; }
+        QLabel#dropLabel { font-size: 13px; color: #374151; }
+        QFrame#dropZone {
+            background: #ffffff;
+            border: 1px dashed #cbd5e1;
+            border-radius: 12px;
+        }
+        QFrame#dropZone:hover { border-color: #ed3b3b; }
+        QFrame#fieldsBox {
+            background: #ffffff; border: 1px solid #e5e7eb;
+            border-radius: 10px;
+        }
+        QLineEdit {
+            background: #f9fafb; border: 1px solid #e5e7eb;
+            border-radius: 6px; padding: 5px 8px;
+            color: #111827; font-size: 13px;
+            selection-background-color: rgba(237,59,59,0.25);
+        }
+        QTextEdit {
+            background: #ffffff;
+            border: 1px solid #d1d5db;
+            border-radius: 10px; padding: 8px;
+            color: #111827; font-size: 13px;
+            selection-background-color: rgba(237,59,59,0.25);
+        }
+        QPushButton {
+            background: #ed3b3b; color: white; border-radius: 10px;
+            padding: 8px 16px; font-size: 13px; font-weight: 600;
+        }
+        QPushButton:hover { background: #c62e2e; }
+        QPushButton#ghost {
+            background: transparent; border: 1px solid #d1d5db;
+            color: #374151; padding: 7px 14px;
+        }
+        QPushButton#ghost:hover { border-color: #ed3b3b; color: #ed3b3b; }
+        QPushButton:disabled { background: #d1d5db; color: #6b7280; }
+        QProgressBar {
+            background: #e5e7eb; border: none; border-radius: 2px;
+        }
+        QProgressBar::chunk { background: #ed3b3b; border-radius: 2px; }
+        """
 
 
 class LoginWindow(QtWidgets.QWidget):
@@ -6378,6 +8558,38 @@ class LoginWindow(QtWidgets.QWidget):
             AppDialog("Not Signed In", "Sign in before scheduling a comment.", self).exec()
             return
         ScheduledCommentDialog(user_data, self).exec()
+
+    def run_ptu_generator(self):
+        """PTU Generator - read a permit from a PDF or an image with Gemini.
+
+        The key comes from this PC first, then from users/{uid} in Firestore, so
+        signing in on a new machine is enough to open the tool. Only when neither
+        has one does the gate appear and ask for it.
+        """
+        user_data = getattr(self, "current_user", None)
+        note = ""
+        key = _load_ai_key()
+        if not key and user_data:
+            try:
+                key = _load_ai_key_remote(user_data)
+            except Exception as e:
+                logger.warning("Could not read the Gemini key from Firestore: %s", e)
+                note = (
+                    f"Your account could not be checked for a saved key ({e}). "
+                    "If you already saved one there, sign in again or try when "
+                    "you are online."
+                )
+            if key:
+                # Cache it so the next open needs no network.
+                _save_ai_key(key)
+        if not key:
+            gate = PtuApiKeyDialog(self, user_data=user_data, note=note)
+            if gate.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return
+            key = gate.saved_key
+            if not key:
+                return
+        PtuGeneratorDialog(self, api_key=key, user_data=user_data).exec()
 
     def run_tool_3(self):
         """Tool 3 — TODO: implement"""
