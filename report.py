@@ -115,7 +115,7 @@ UPDATE_OK_FILE = "_update_ok.flag"       # written once a window is up
 UPDATE_FAILED_FILE = "_update_failed.txt"  # written by the swap script
 
 # ================= AUTO-UPDATE CONFIG =================
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.0.1"
 GITHUB_REPO = "shinispades/AutoReport"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -301,6 +301,22 @@ def _fetch_pat_expiry(pat):
         return None
 
 
+def _asset_kind(name):
+    """What a release asset is, judged from its name.
+
+    A `.zip` is extracted in place. An exe is normally named `*.exe`, but a
+    release may upload it as `Report.exe.NewUpdate` so extension-based
+    scanners do not treat the download as an executable. It is still the exe,
+    and the swap script gives it its real name back after the app exits.
+    """
+    lowered = str(name or "").strip().lower()
+    if lowered.endswith(".zip"):
+        return "zip"
+    if lowered.endswith(".exe") or ".exe." in lowered:
+        return "exe"
+    return None
+
+
 def _check_for_update():
     """
     Check GitHub for the latest release. Returns a dict with
@@ -349,16 +365,18 @@ def _check_for_update():
         # they are the only way to tell a good download from a truncated one.
         assets = data.get("assets", [])
         chosen = None
-        for wanted in (".zip", ".exe"):
+        asset_type = ""
+        for wanted in ("zip", "exe"):
             for asset in assets:
-                if asset.get("name", "").lower().endswith(wanted):
+                if _asset_kind(asset.get("name", "")) == wanted:
                     chosen = asset
+                    asset_type = wanted
                     break
             if chosen:
                 break
 
         if not chosen:
-            logger.warning("No .zip or .exe asset found in release %s", tag)
+            logger.warning("No .zip, .exe or .exe.* asset found in release %s", tag)
             return None
 
         download_url = chosen.get("browser_download_url")
@@ -366,7 +384,6 @@ def _check_for_update():
             logger.warning("Asset %r has no download URL", chosen.get("name"))
             return None
 
-        asset_type = "zip" if chosen.get("name", "").lower().endswith(".zip") else "exe"
         logger.info("Update asset found: type=%s, url=%s", asset_type, download_url[:80])
         logger.info("Update asset metadata: size=%r digest=%r",
                     chosen.get("size"), chosen.get("digest"))
@@ -2181,6 +2198,9 @@ class LoginWorker(QThread):
                 "display_name": profile.get("display_name", ""),
                 "unique_name": profile.get("unique_name", ""),
                 "pat_expiry": profile.get("pat_expiry", ""),
+                # Read-only copy for Settings: it says whether the PTU tool's
+                # key is already on the account without another round trip.
+                PTU_AI_KEY_FIELD: profile.get(PTU_AI_KEY_FIELD, ""),
                 "id_token": id_token,
                 "refresh_token": session["refresh_token"],
             }
@@ -6775,6 +6795,10 @@ class PtuGeneratorDialog(QDialog):
         # The key already accepted for this session; a successful read remembers
         # it on the PC and on the account, but not twice for the same key.
         self._synced_key = ""
+        # run_ptu_generator() already found the key (this PC, the account, or the
+        # first-use gate) and the tool never edits it: changing it is a Settings
+        # job, so this dialog only reads permits.
+        self.api_key = api_key or ""
         self.setWindowTitle("PTU Generator")
         self.setObjectName("PtuGenerator")
         self.setMinimumSize(900, 760)
@@ -6828,35 +6852,6 @@ class PtuGeneratorDialog(QDialog):
         buttons.addStretch()
         buttons.addWidget(self.copy_btn)
         layout.addLayout(buttons)
-
-        # The permit is read by Gemini, so a key is what gets this tool opened at
-        # all. The row stays so the key can be replaced. It is stored the way
-        # the TFS PAT is - DPAPI, per Windows user - never bundled into the exe.
-        key_row = QtWidgets.QHBoxLayout()
-        key_row.setSpacing(10)
-        key_label = QtWidgets.QLabel("Gemini API key")
-        self.ai_key_edit = QtWidgets.QLineEdit()
-        self.ai_key_edit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        self.ai_key_edit.setText(api_key or _load_ai_key())
-        self.ai_key_edit.setPlaceholderText("Paste the key from Google AI Studio")
-        self.getkey_btn = QPushButton("Get a key")
-        self.getkey_btn.setObjectName("ghost")
-        self.getkey_btn.setToolTip(PTU_AI_KEY_URL)
-        self.getkey_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl(PTU_AI_KEY_URL))
-        )
-        self.forget_btn = QPushButton("Forget key")
-        self.forget_btn.setObjectName("ghost")
-        self.forget_btn.setToolTip(
-            "Delete the saved key from this PC and from your account, then paste "
-            "a different one."
-        )
-        self.forget_btn.clicked.connect(self._forget_key)
-        key_row.addWidget(key_label)
-        key_row.addWidget(self.ai_key_edit, stretch=1)
-        key_row.addWidget(self.getkey_btn)
-        key_row.addWidget(self.forget_btn)
-        layout.addLayout(key_row)
 
         # The five header fields, read-only: select a value to copy it, and a
         # field the OCR could not pin down says "not found" instead of lying.
@@ -6997,13 +6992,13 @@ class PtuGeneratorDialog(QDialog):
     # --- reading ---
 
     def _ai_key(self):
-        """The key to send with, or "" - with a prompt when it is missing."""
-        key = self.ai_key_edit.text().strip()
-        if not key:
+        """The key the tool was opened with, or "" when there is none."""
+        if not self.api_key:
             self.status_label.setText(
-                "Paste a Gemini API key on the row above before reading a file."
+                "No Gemini API key is saved. Add one in Settings, then reopen "
+                "the PTU Generator."
             )
-        return key
+        return self.api_key
 
     def _start(self, path):
         if self._worker is not None and self._worker.isRunning():
@@ -7027,40 +7022,6 @@ class PtuGeneratorDialog(QDialog):
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
 
-    def _forget_key(self):
-        """Delete the saved key here and on the account, then ask for another."""
-        if self._worker is not None and self._worker.isRunning():
-            self.status_label.setText(
-                "Wait for the current read to finish before removing the key."
-            )
-            return
-        answer = QtWidgets.QMessageBox.question(
-            self,
-            "Remove the Gemini key",
-            "Delete the saved Gemini API key?\n\n"
-            "It is removed from this PC and from your account, and the tool "
-            "will ask for a key again before it can read a permit.",
-        )
-        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
-            return
-        removed_here = _delete_ai_key()
-        removed_remote = _delete_ai_key_remote(self.user_data)
-        self.ai_key_edit.clear()
-        self._synced_key = ""
-        if removed_here and removed_remote:
-            self.status_label.setText("Gemini key removed from this PC and your account.")
-        elif removed_here:
-            self.status_label.setText(
-                "Gemini key removed from this PC; your account could not be "
-                "updated, so it may still be there."
-            )
-        elif removed_remote:
-            self.status_label.setText("Gemini key removed from your account.")
-        else:
-            self.status_label.setText(
-                "No saved key was found - paste one above to use the tool."
-            )
-
     def _remember_key(self, key, verified=False):
         """Keep the key: on this PC always, on the account once it is proven.
 
@@ -7083,7 +7044,7 @@ class PtuGeneratorDialog(QDialog):
             for key, value in ai_fields.items():
                 if value:
                     values[key] = value
-            self._remember_key(self.ai_key_edit.text().strip(), verified=True)
+            self._remember_key(self.api_key, verified=True)
         found = sum(1 for value in values.values() if value)
         summary = f"{found}/5 fields found."
         self._set_busy(False, f"{note} {summary}" if note else summary)
@@ -7116,9 +7077,6 @@ class PtuGeneratorDialog(QDialog):
             self.browse_btn,
             self.paste_btn,
             self.drop_zone,
-            self.ai_key_edit,
-            self.getkey_btn,
-            self.forget_btn,
         ):
             if _ui_alive(widget):
                 widget.setEnabled(not busy)
@@ -8088,6 +8046,38 @@ class LoginWindow(QtWidgets.QWidget):
 
         tc = self._theme_colors()
 
+        # Buttons on this page carry their own style so they keep their design
+        # inside the scroll area, where a stylesheet set on an ancestor can
+        # override the main window's QPushButton rule.
+        primary_style = f"""
+            QPushButton {{
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 #ed3b3b, stop:1 #c62e2e);
+                border: none;
+                border-radius: 10px;
+                padding: 10px 16px;
+                color: white;
+                font-size: 13.5px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{ background: #c62e2e; }}
+        """
+        ghost_style = f"""
+            QPushButton {{
+                background: transparent;
+                border: 1px solid {tc['field_border']};
+                border-radius: 10px;
+                padding: 8px 14px;
+                color: {tc['field_label']};
+                font-size: 13px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                border-color: {tc['field_focus_border']};
+                color: {tc['section_label']};
+            }}
+        """
+
         # --- Top Bar (Back Arrow) ---
         top_bar = QtWidgets.QHBoxLayout()
         back_btn = QtWidgets.QToolButton()
@@ -8117,7 +8107,7 @@ class LoginWindow(QtWidgets.QWidget):
         layout.addWidget(title)
         layout.addSpacing(6)
 
-        subtitle = QtWidgets.QLabel("Manage your account and PAT settings.")
+        subtitle = QtWidgets.QLabel("Manage your account, PAT and Gemini API key settings.")
         subtitle.setObjectName("Subtitle")
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
@@ -8207,6 +8197,7 @@ class LoginWindow(QtWidgets.QWidget):
         save_btn = QtWidgets.QPushButton("Save")
         save_btn.setFixedHeight(42)
         save_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        save_btn.setStyleSheet(primary_style)
         save_btn.clicked.connect(self.save_pat_expiry)
         save_btn.setFixedWidth(120)
 
@@ -8224,6 +8215,93 @@ class LoginWindow(QtWidgets.QWidget):
         else:
             self.settings_status.setStyleSheet("color: #16a34a; font-weight: 600; font-size: 12.5px;")
         layout.addWidget(self.settings_status)
+
+        # --- Gemini API key (used by the PTU Generator) ---
+        layout.addSpacing(24)
+
+        divider_ai = QtWidgets.QFrame()
+        divider_ai.setFixedHeight(1)
+        divider_ai.setStyleSheet(f"background: {tc['divider']}; border: none;")
+        layout.addWidget(divider_ai)
+        layout.addSpacing(20)
+
+        ai_section_label = QtWidgets.QLabel("GEMINI API KEY")
+        ai_section_label.setStyleSheet(f"""
+            color: {tc['section_label']};
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 1.5px;
+        """)
+        layout.addWidget(ai_section_label)
+        layout.addSpacing(12)
+
+        ai_field_label = QtWidgets.QLabel("Key used by the PTU Generator")
+        ai_field_label.setStyleSheet(
+            f"color: {tc['field_label']}; font-size: 12px; font-weight: 600;"
+        )
+        layout.addWidget(ai_field_label)
+        layout.addSpacing(6)
+
+        self.settings_ai_key_input = QtWidgets.QLineEdit()
+        self.settings_ai_key_input.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.settings_ai_key_input.setPlaceholderText(
+            "Paste a new key to add or replace the saved one"
+        )
+        self.settings_ai_key_input.returnPressed.connect(self.save_ai_key)
+        self.settings_ai_key_input.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {tc['field_bg']};
+                border: 1px solid {tc['field_border']};
+                border-radius: 8px;
+                padding: 9px 10px;
+                color: {tc['field_text']};
+                font-size: 13px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {tc['field_focus_border']};
+            }}
+        """)
+        layout.addWidget(self.settings_ai_key_input)
+        layout.addSpacing(8)
+
+        self.settings_ai_key_status = QtWidgets.QLabel(
+            "A key is saved. Paste a new one above to replace it."
+            if self._saved_ai_key()
+            else "No key saved yet - the PTU Generator asks for one the first "
+            "time it opens."
+        )
+        self.settings_ai_key_status.setWordWrap(True)
+        self.settings_ai_key_status.setStyleSheet("color: #6b7280; font-size: 11px;")
+        layout.addWidget(self.settings_ai_key_status)
+        layout.addSpacing(12)
+
+        ai_btn_layout = QtWidgets.QHBoxLayout()
+        ai_get_btn = QtWidgets.QPushButton("Get a key")
+        ai_get_btn.setFixedHeight(38)
+        ai_get_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        ai_get_btn.setToolTip(PTU_AI_KEY_URL)
+        ai_get_btn.setStyleSheet(ghost_style)
+        ai_get_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(PTU_AI_KEY_URL))
+        )
+        ai_remove_btn = QtWidgets.QPushButton("Remove")
+        ai_remove_btn.setFixedHeight(38)
+        ai_remove_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        ai_remove_btn.setToolTip(
+            "Delete the saved key from this PC and from your account."
+        )
+        ai_remove_btn.setStyleSheet(ghost_style)
+        ai_remove_btn.clicked.connect(self.remove_ai_key)
+        ai_save_btn = QtWidgets.QPushButton("Save key")
+        ai_save_btn.setFixedHeight(38)
+        ai_save_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        ai_save_btn.setStyleSheet(primary_style)
+        ai_save_btn.clicked.connect(self.save_ai_key)
+        ai_btn_layout.addWidget(ai_get_btn)
+        ai_btn_layout.addWidget(ai_remove_btn)
+        ai_btn_layout.addStretch()
+        ai_btn_layout.addWidget(ai_save_btn)
+        layout.addLayout(ai_btn_layout)
 
         # --- Application / updates ---
         layout.addSpacing(24)
@@ -8265,7 +8343,110 @@ class LoginWindow(QtWidgets.QWidget):
         self.update_status_label.setStyleSheet("color: #6b7280; font-size: 11.5px;")
         layout.addWidget(self.update_status_label)
 
-        self.main_layout.addWidget(card, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+        # The card is taller than a 1366x768 screen once the key section is in
+        # it, so the page scrolls instead of resizing the window past the screen.
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.viewport().setAutoFillBackground(False)
+        scroll_area.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroll_area.setStyleSheet(f"""
+            QScrollArea {{ border: none; background: transparent; }}
+            QScrollBar:vertical {{ width: 5px; background: transparent; }}
+            QScrollBar::handle:vertical {{
+                background: {tc['divider']}; border-radius: 2px; min-height: 20px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        """)
+        scroll_widget = QtWidgets.QWidget()
+        # Scoped on purpose: a bare "background" declaration here would cascade
+        # into every child and strip the fill off the card's buttons.
+        scroll_widget.setObjectName("SettingsScrollBody")
+        scroll_widget.setStyleSheet(
+            "QWidget#SettingsScrollBody { background: transparent; }"
+        )
+        scroll_layout = QtWidgets.QVBoxLayout(scroll_widget)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop
+        )
+        scroll_layout.addWidget(card)
+        scroll_area.setWidget(scroll_widget)
+        self.main_layout.addWidget(scroll_area)
+
+
+    def _saved_ai_key(self):
+        """The Gemini key known right now: this PC's copy, else the account's."""
+        key = _load_ai_key()
+        if not key:
+            user_data = getattr(self, "current_user", None) or {}
+            key = str(user_data.get(PTU_AI_KEY_FIELD) or "").strip()
+        return key
+
+    def save_ai_key(self):
+        """Settings: store the PTU Generator's Gemini key here and on the account."""
+        key = self.settings_ai_key_input.text().strip()
+        if not key:
+            self.settings_ai_key_status.setText(
+                "Paste a key first, or open Google AI Studio to create one."
+            )
+            self.settings_ai_key_input.setFocus()
+            return
+        user_data = getattr(self, "current_user", None) or {}
+        saved_here = _save_ai_key(key)
+        saved_remote = _save_ai_key_remote(user_data, key) if user_data else False
+        if not (saved_here or saved_remote):
+            self.settings_ai_key_status.setText(
+                "The key could not be saved - see the log for why."
+            )
+            return
+        if user_data:
+            user_data[PTU_AI_KEY_FIELD] = key
+        self.settings_ai_key_input.clear()
+        if saved_here and (saved_remote or not user_data):
+            self.settings_ai_key_status.setText("Key saved.")
+        elif saved_here:
+            self.settings_ai_key_status.setText(
+                "Key saved on this PC. It could not be sent to your account, so "
+                "another PC will ask for it."
+            )
+        else:
+            self.settings_ai_key_status.setText(
+                "Key saved to your account. It could not be stored on this PC; "
+                "the PTU Generator will fetch it when it opens."
+            )
+
+    def remove_ai_key(self):
+        """Settings: delete the saved Gemini key here and on the account."""
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Remove the Gemini key",
+            "Delete the saved Gemini API key?\n\n"
+            "It is removed from this PC and from your account, and the PTU "
+            "Generator asks for a key again before it can read a permit.",
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        user_data = getattr(self, "current_user", None) or {}
+        removed_here = _delete_ai_key()
+        removed_remote = _delete_ai_key_remote(user_data) if user_data else False
+        if not (removed_here or removed_remote):
+            self.settings_ai_key_status.setText("No saved key was found.")
+            return
+        if user_data:
+            user_data[PTU_AI_KEY_FIELD] = ""
+        if removed_here and removed_remote:
+            self.settings_ai_key_status.setText(
+                "Key removed from this PC and your account."
+            )
+        elif removed_here:
+            self.settings_ai_key_status.setText(
+                "Key removed from this PC; your account could not be updated, "
+                "so it may still be there."
+            )
+        else:
+            self.settings_ai_key_status.setText("Key removed from your account.")
 
 
     def save_pat_expiry(self):
